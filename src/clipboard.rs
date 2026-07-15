@@ -777,6 +777,15 @@ pub fn handle_msg_clipboard(mut cb: Clipboard) {
     if cb.compress {
         cb.content = bytes::Bytes::from(hbb_common::compress::decompress(&cb.content));
     }
+    // lobishell-android (bidirectional clipboard sync): also feed our own poll-based text buffer
+    // (scrap::android::ffi::set_remote_clipboard_text) — the call_clipboard_manager_update_clipboard
+    // call below is a no-op for us (no Java ClipboardManager object registered, see that function's
+    // doc), so without this the received clipboard content would silently go nowhere.
+    if cb.format.enum_value() == Ok(hbb_common::message_proto::ClipboardFormat::Text) {
+        if let Ok(text) = String::from_utf8(cb.content.to_vec()) {
+            scrap::android::ffi::set_remote_clipboard_text(text);
+        }
+    }
     let multi_clips = MultiClipboards {
         clipboards: vec![cb],
         ..Default::default()
@@ -793,6 +802,17 @@ pub fn handle_msg_multi_clipboards(mut mcb: MultiClipboards) {
     for cb in mcb.clipboards.iter_mut() {
         if cb.compress {
             cb.content = bytes::Bytes::from(hbb_common::compress::decompress(&cb.content));
+        }
+    }
+    // lobishell-android: same reasoning as handle_msg_clipboard's — feed the first plain-text clip
+    // into our own poll-based buffer, since the Java ClipboardManager path is unusable for us.
+    if let Some(text_cb) = mcb
+        .clipboards
+        .iter()
+        .find(|c| c.format.enum_value() == Ok(hbb_common::message_proto::ClipboardFormat::Text))
+    {
+        if let Ok(text) = String::from_utf8(text_cb.content.to_vec()) {
+            scrap::android::ffi::set_remote_clipboard_text(text);
         }
     }
     if let Ok(bytes) = mcb.write_to_bytes() {

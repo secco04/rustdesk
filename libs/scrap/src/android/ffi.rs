@@ -120,6 +120,49 @@ pub fn get_clipboards(client: bool) -> Option<MultiClipboards> {
     }
 }
 
+/// lobishell-android (bidirectional clipboard sync, plain text only): pushes local Android
+/// clipboard text into the SAME buffer `Client::try_start_clipboard`'s existing polling loop
+/// already reads from (`get_clipboards(true)` every ~333ms, unconditionally spawned as part of
+/// normal peer-info handling in io_loop.rs — not gated behind Flutter's Dart isolate/event_stream,
+/// so it already runs for a headless session with no changes needed there). Bypasses the Java
+/// `ClipboardManager` JNI callback contract (`Java_ffi_FFI_onClipboardUpdate`/`CLIPBOARD_MANAGER`)
+/// entirely — that path requires a registered Java object we don't have, and hard-fails silently
+/// without one. Reuses all of RustDesk's own existing timing/compression/permission-gating logic
+/// for the outgoing direction; only the "how does new local clipboard content get IN" step changes.
+pub fn push_outgoing_clipboard_text(text: String) {
+    use hbb_common::message_proto::{Clipboard, ClipboardFormat};
+    let cb = Clipboard {
+        content: bytes::Bytes::from(text.into_bytes()),
+        format: hbb_common::protobuf::EnumOrUnknown::new(ClipboardFormat::Text),
+        ..Default::default()
+    };
+    *CLIPBOARDS_CLIENT.lock().unwrap() = Some(MultiClipboards {
+        clipboards: vec![cb],
+        ..Default::default()
+    });
+}
+
+lazy_static! {
+    // lobishell-android: last plain-text clipboard content received FROM the peer — populated by
+    // clipboard.rs's handle_msg_clipboard/handle_msg_multi_clipboards (see set_remote_clipboard_text's
+    // doc), polled by our own JNI shim's getRemoteClipboardText. Clear-on-read, same pattern as
+    // getFrame's rgba buffer.
+    static ref LAST_REMOTE_CLIPBOARD_TEXT: Mutex<Option<String>> = Mutex::new(None);
+}
+
+/// lobishell-android: called from clipboard.rs with the first plain-text clip found in a received
+/// Clipboard/MultiClipboards message, instead of routing through the (unusable, no Java object)
+/// ClipboardManager JNI callback.
+pub fn set_remote_clipboard_text(text: String) {
+    *LAST_REMOTE_CLIPBOARD_TEXT.lock().unwrap() = Some(text);
+}
+
+/// lobishell-android: takes (clears) the last remote clipboard text, or None if nothing new since
+/// the last call.
+pub fn take_remote_clipboard_text() -> Option<String> {
+    LAST_REMOTE_CLIPBOARD_TEXT.lock().unwrap().take()
+}
+
 #[no_mangle]
 pub extern "system" fn Java_ffi_FFI_onVideoFrameUpdate(
     env: JNIEnv,
