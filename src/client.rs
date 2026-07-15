@@ -4139,7 +4139,12 @@ pub mod peer_online {
         connect_tcp(online_server, CONNECT_TIMEOUT).await
     }
 
-    async fn query_online_states_(
+    // lobishell-android: widened from private to pub(crate) (no logic change) so flutter.rs's
+    // session_is_id_online can call this directly — the existing pub query_online_states wrapper
+    // needs start_flutter_async_runner() + a global Flutter event stream to deliver its result,
+    // neither of which our headless (non-Flutter) client sets up; this lower-level primitive
+    // already returns the (onlines, offlines) pair directly, no callback/event-stream needed.
+    pub(crate) async fn query_online_states_(
         ids: &Vec<String>,
         timeout: std::time::Duration,
     ) -> ResultType<(Vec<String>, Vec<String>)> {

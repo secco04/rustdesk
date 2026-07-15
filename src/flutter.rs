@@ -1810,6 +1810,41 @@ pub fn session_get_display_count(session_id: SessionID) -> i32 {
     0
 }
 
+/// Pre-connect online check (lobishell-android): queries the rendezvous server directly for
+/// whether `id` is currently online, without needing a session at all. RustDesk's own public
+/// `client::peer_online::query_online_states` wrapper delivers its result through
+/// `start_flutter_async_runner` + a global Flutter event stream — plumbing our headless client
+/// never sets up (same reason `session_start_headless` exists). This instead blocks on the
+/// lower-level `query_online_states_` primitive directly (now `pub(crate)`, see its doc), which
+/// already returns the (onlines, offlines) pair with no callback needed. Uses whatever
+/// custom-server config was last set via `main_set_option` (same as a real connect). Blocks the
+/// calling thread for up to ~3s (the query's own internal timeout) — call off the UI thread.
+/// Returns 1 = online, 0 = offline, -1 = unknown (query itself failed, e.g. no network reachable
+/// to the rendezvous server) — callers should treat -1 as "don't block the normal connect flow",
+/// not as a definite offline.
+pub fn session_is_id_online(id: String) -> i32 {
+    let rt = match hbb_common::tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(_) => return -1,
+    };
+    let ids = vec![id.clone()];
+    match rt.block_on(crate::client::peer_online::query_online_states_(
+        &ids,
+        std::time::Duration::from_millis(3_000),
+    )) {
+        Ok((onlines, offlines)) => {
+            if onlines.contains(&id) {
+                1
+            } else if offlines.contains(&id) {
+                0
+            } else {
+                -1
+            }
+        }
+        Err(_) => -1,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn session_get_rgba(session_uuid_str: *const char, display: usize) -> *const u8 {
     if let Ok(session_id) = char_to_session_id(session_uuid_str) {
