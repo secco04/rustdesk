@@ -1798,6 +1798,18 @@ pub fn session_get_display_size(session_id: SessionID, display: usize) -> (i32, 
     (0, 0)
 }
 
+/// Multi-monitor (lobishell-android): sync, pollable count of displays the peer reported — same
+/// "small additive getter next to session_get_display_size" pattern, for the same headless-session
+/// reason (no event_stream to push the count through). Used by the Android client to decide
+/// whether to show a display picker at all, and to bound the index passed to
+/// flutter_ffi::session_switch_display. Returns 0 if not known yet.
+pub fn session_get_display_count(session_id: SessionID) -> i32 {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        return session.peer_info.read().unwrap().displays.len() as i32;
+    }
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn session_get_rgba(session_uuid_str: *const char, display: usize) -> *const u8 {
     if let Ok(session_id) = char_to_session_id(session_uuid_str) {
