@@ -98,6 +98,18 @@ pub enum EventToUI {
     Texture(usize, bool), // (display, gpu_texture)
 }
 
+// M2 (plans/soft-frolicking-thimble.md): flutter_rust_bridge_codegen generates `impl IntoDart for
+// EventToUI` (see bridge_generated.rs) but never an `impl IntoIntoDart<EventToUI> for EventToUI` —
+// that trait is only implemented in the flutter_rust_bridge crate itself for a fixed whitelist of
+// types (primitives, tuples, Vec, Option, ...), not auto-derived for custom enums, even though
+// StreamSink<EventToUI> (used by session_start) requires it. This is the identity impl the
+// `impl_into_into_dart!` macro would produce for a primitive type, applied by hand here.
+impl flutter_rust_bridge::rust2dart::IntoIntoDart<EventToUI> for EventToUI {
+    fn into_into_dart(self) -> EventToUI {
+        self
+    }
+}
+
 pub fn host_stop_system_key_propagate(_stopped: bool) {
     #[cfg(windows)]
     crate::platform::windows::stop_system_key_propagate(_stopped);

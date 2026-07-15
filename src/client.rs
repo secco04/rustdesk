@@ -4,14 +4,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use clipboard_master::CallbackResult;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, Host, StreamConfig,
 };
 use crossbeam_queue::ArrayQueue;
-use magnum_opus::{Channels::*, Decoder as AudioDecoder};
-#[cfg(not(target_os = "linux"))]
+use crate::audio_codec_stub::{Channels::*, Decoder as AudioDecoder};
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 use ringbuf::{ring_buffer::RbBase, Rb};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -131,7 +131,7 @@ pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str =
 pub const SCRAP_X11_REQUIRED: &str = "x11 expected";
 pub const SCRAP_X11_REF_URL: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub const AUDIO_BUFFER_MS: usize = 3000;
 
 #[cfg(feature = "flutter")]
@@ -159,7 +159,7 @@ struct ClipboardState {
     running: bool,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 lazy_static::lazy_static! {
     static ref AUDIO_HOST: Host = cpal::default_host();
 }
@@ -1184,26 +1184,26 @@ pub struct AudioHandler {
     audio_decoder: Option<(AudioDecoder, Vec<f32>)>,
     #[cfg(target_os = "linux")]
     simple: Option<psimple::Simple>,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     audio_buffer: AudioBuffer,
     sample_rate: (u32, u32),
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     audio_stream: Option<Box<dyn StreamTrait>>,
     channels: u16,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     device_channel: u16,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     ready: Arc<std::sync::Mutex<bool>>,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 struct AudioBuffer(
     pub Arc<std::sync::Mutex<ringbuf::HeapRb<f32>>>,
     usize,
     [usize; 30],
 );
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 impl Default for AudioBuffer {
     fn default() -> Self {
         Self(
@@ -1216,7 +1216,7 @@ impl Default for AudioBuffer {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 impl AudioBuffer {
     pub fn resize(&mut self, sample_rate: usize, channels: usize) {
         let capacity = sample_rate * channels * AUDIO_BUFFER_MS / 1000;
@@ -1348,8 +1348,17 @@ impl AudioHandler {
         Ok(())
     }
 
+    // M2 (plans/soft-frolicking-thimble.md): audio playback deferred on Android (cpal's Android
+    // backend needs oboe, which has real ABI incompatibilities with NDK r30 — see Cargo.toml's
+    // cpal dependency comment). No-op for now; audio_decoder is already stubbed too, see
+    // src/audio_codec_stub.rs.
+    #[cfg(target_os = "android")]
+    fn start_audio(&mut self, _format0: AudioFormat) -> ResultType<()> {
+        Ok(())
+    }
+
     /// Start the audio playback.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn start_audio(&mut self, format0: AudioFormat) -> ResultType<()> {
         let device = AUDIO_HOST
             .default_output_device()
@@ -1417,7 +1426,7 @@ impl AudioHandler {
     /// Handle audio frame and play it.
     #[inline]
     pub fn handle_frame(&mut self, frame: AudioFrame) {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         if self.audio_stream.is_none() || !self.ready.lock().unwrap().clone() {
             return;
         }
@@ -1430,7 +1439,7 @@ impl AudioHandler {
             if let Ok(n) = d.decode_float(&frame.data, buffer, false) {
                 let channels = self.channels;
                 let n = n * (channels as usize);
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
                 {
                     let sample_rate0 = self.sample_rate.0;
                     let sample_rate = self.sample_rate.1;
@@ -1465,7 +1474,7 @@ impl AudioHandler {
     }
 
     /// Build audio output stream for current device.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn build_output_stream<T: cpal::Sample + cpal::SizedSample + cpal::FromSample<f32>>(
         &mut self,
         config: &StreamConfig,
@@ -1567,12 +1576,22 @@ impl VideoHandler {
     pub fn new(format: CodecFormat, _display: usize) -> Self {
         let luid = Self::get_adapter_luid();
         log::info!("new video handler for display #{_display}, format: {format:?}, luid: {luid:?}");
-        let rgba_format =
-            if cfg!(feature = "flutter") && (cfg!(windows) || cfg!(target_os = "linux")) {
-                ImageFormat::ABGR
-            } else {
-                ImageFormat::ARGB
-            };
+        // M3 (plans/soft-frolicking-thimble.md): scrap's "ARGB"/"ABGR" names refer to libyuv's
+        // packed-32-bit-int naming, which is the OPPOSITE of their actual in-memory byte order on
+        // little-endian: ImageFormat::ARGB writes B,G,R,A bytes; ImageFormat::ABGR writes R,G,B,A
+        // bytes. Android always takes the soft-render path (`on_rgba` is unconditionally routed to
+        // `on_rgba_soft_render` for `target_os = "android"`, never the GPU texture path other
+        // platforms use), and our android-shim JNI shim copies that raw buffer straight into an
+        // Android `Bitmap.Config.ARGB_8888`, whose in-memory layout is R,G,B,A — i.e. it needs
+        // ABGR here, same as the windows/linux Flutter case, not the `else` branch it fell into
+        // before (confirmed on-device: UI elements that are blue rendered with a red tint).
+        let rgba_format = if cfg!(feature = "flutter")
+            && (cfg!(windows) || cfg!(target_os = "linux") || cfg!(target_os = "android"))
+        {
+            ImageFormat::ABGR
+        } else {
+            ImageFormat::ARGB
+        };
         VideoHandler {
             decoder: Decoder::new(format, luid),
             rgb: ImageRgb::new(rgba_format, crate::get_dst_align_rgba()),

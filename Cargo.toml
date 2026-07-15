@@ -31,7 +31,7 @@ hwcodec = ["scrap/hwcodec"]
 vram = ["scrap/vram"]
 mediacodec = ["scrap/mediacodec"]
 plugin_framework = []
-linux-pkg-config = ["magnum-opus/linux-pkg-config", "scrap/linux-pkg-config"]
+# linux-pkg-config = ["magnum-opus/linux-pkg-config", "scrap/linux-pkg-config"] # magnum-opus deferred, see above
 unix-file-copy-paste = [
     "dep:x11-clipboard",
     "dep:x11rb",
@@ -45,7 +45,10 @@ screencapturekit = ["cpal/screencapturekit"]
 
 [dependencies]
 async-trait = "0.1"
-scrap = { path = "libs/scrap", features = ["wayland"] }
+# M1 (plans/soft-frolicking-thimble.md): flutter_ffi.rs needs scrap regardless of target, so this
+# isn't optional once the "flutter" feature is on. "wayland" dropped — Linux-desktop-only capture
+# backend (gstreamer/dbus), irrelevant and likely non-cross-compilable for Android.
+scrap = { path = "libs/scrap" }
 hbb_common = { path = "libs/hbb_common" }
 serde_derive = "1.0"
 serde = "1.0"
@@ -56,7 +59,11 @@ lazy_static = "1.4"
 sha2 = "0.10"
 repng = "0.2"
 parity-tokio-ipc = { git = "https://github.com/rustdesk-org/parity-tokio-ipc" }
-magnum-opus = { git = "https://github.com/rustdesk-org/magnum-opus" }
+# M1 (plans/soft-frolicking-thimble.md): temporarily removed — pins bindgen "0.59", incompatible
+# with scrap's 0.65 / kcp-sys's 0.71.1 in the same build (NDK cross-compile needs explicit
+# --target/--sysroot clang args that 0.59 doesn't forward the same way). Audio was already out of
+# scope for M1-M4 per the plan, so deferring this matches the plan rather than fighting versions.
+# magnum-opus = { git = "https://github.com/rustdesk-org/magnum-opus" }
 dasp = { version = "0.11", features = ["signal", "interpolate-linear", "interpolate"], optional = true }
 rubato = { version = "0.12", optional = true }
 samplerate = { version = "0.2", optional = true }
@@ -78,11 +85,19 @@ zip = "0.6"
 shutdown_hooks = "0.1"
 totp-rs = { version = "5.4", default-features = false, features = ["gen_secret", "otpauth"] }
 stunclient = "0.4"
-kcp-sys= { git = "https://github.com/rustdesk-org/kcp-sys"}
+# M1 (plans/soft-frolicking-thimble.md): removed, see src/kcp_stream.rs's doc comment for why.
+# kcp-sys= { git = "https://github.com/rustdesk-org/kcp-sys"}
 reqwest = { version = "0.12", features = ["blocking", "socks", "json", "native-tls", "rustls-tls", "rustls-tls-native-roots", "gzip"], default-features=false }
 
-[target.'cfg(not(target_os = "linux"))'.dependencies]
+[target.'cfg(not(any(target_os = "linux", target_os = "android")))'.dependencies]
 # https://github.com/rustdesk/rustdesk/discussions/10197, not use cpal on linux
+# M2 (plans/soft-frolicking-thimble.md): also not on android for now — cpal's Android backend
+# needs oboe (vcpkg port), and vcpkg's oboe 1.10.0 has real ABI/version incompatibilities with the
+# newer NDK r30 AAudio headers (redefinition of AAudio_FallbackMode etc., then a static_assert on
+# AAudio_DeviceType's underlying type) — a real third-party version-skew bug, not something to
+# patch around further here. Audio (both codec via magnum-opus and I/O via cpal) was already out of
+# scope for M1-M4. Call sites gated accordingly, search for "cfg(not(target_os = \"android\"))" near
+# `cpal::` usage in client.rs / server/audio_service.rs / common.rs.
 cpal = { git = "https://github.com/rustdesk-org/cpal", branch = "osx-screencapturekit" }
 ringbuf = "0.3"
 
@@ -221,8 +236,14 @@ winapi = { version = "0.3", features = [ "winnt", "pdh", "synchapi" ] }
 
 [build-dependencies]
 cc = "1.0"
-hbb_common = { path = "libs/hbb_common" }
+# M1 experiment (plans/soft-frolicking-thimble.md): hbb_common removed as a build-dependency —
+# build.rs only ever used it for gen_version(), a trivial Cargo.toml-parsing text generator, but
+# pulling in the whole crate (incl. sodiumoxide/libsodium-sys) as a HOST build-dependency broke
+# cross-compiling to Android because libsodium-sys 0.2.7 doesn't support separate host/target
+# SODIUM_LIB_DIR values. gen_version()'s logic is inlined directly into build.rs instead.
+# hbb_common = { path = "libs/hbb_common" }
 os-version = "0.2"
+chrono = "0.4"
 
 [dev-dependencies]
 hound = "3.5"

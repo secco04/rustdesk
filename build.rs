@@ -71,20 +71,53 @@ fn install_android_deps() {
         "cargo:rustc-link-search={}",
         path.join("lib").to_str().unwrap()
     );
-    println!("cargo:rustc-link-lib=ndk_compat");
-    println!("cargo:rustc-link-lib=oboe");
+    // M2 (plans/soft-frolicking-thimble.md): removed — nothing in this build actually needs
+    // oboe/ndk_compat. cpal (the only real oboe consumer) is excluded for android in Cargo.toml
+    // (see that file's comment), and audio_service.rs's own android path (`pa_impl`) already uses
+    // `scrap::android::ffi::get_audio_raw()` directly, no oboe involved. These were an unconditional
+    // blanket link requirement for every Android build regardless of what's actually referenced.
+    // println!("cargo:rustc-link-lib=ndk_compat");
+    // println!("cargo:rustc-link-lib=oboe");
     println!("cargo:rustc-link-lib=c++");
     println!("cargo:rustc-link-lib=OpenSLES");
 }
 
+// Inlined from hbb_common::gen_version() (see the Cargo.toml [build-dependencies] comment for why).
+fn gen_version() {
+    use std::io::{BufRead, Write};
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    let mut file = std::fs::File::create("./src/version.rs").unwrap();
+    let cargo_toml = std::io::BufReader::new(std::fs::File::open("Cargo.toml").unwrap());
+    for line in cargo_toml.lines().map_while(Result::ok) {
+        let ab: Vec<&str> = line.split('=').map(|x| x.trim()).collect();
+        if ab.len() == 2 && ab[0] == "version" {
+            file.write_all(format!("pub const VERSION: &str = {};\n", ab[1]).as_bytes())
+                .ok();
+            break;
+        }
+    }
+    let build_date = format!("{}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
+    file.write_all(format!("#[allow(dead_code)]\npub const BUILD_DATE: &str = \"{build_date}\";\n").as_bytes())
+        .ok();
+}
+
 fn main() {
-    hbb_common::gen_version();
+    gen_version();
     install_android_deps();
-    #[cfg(all(windows, feature = "inline"))]
-    build_manifest();
-    #[cfg(windows)]
-    build_windows();
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
+    // M1 experiment (plans/soft-frolicking-thimble.md): these were gated on #[cfg(windows)], which
+    // reflects the build SCRIPT's own (host) compile target, not CARGO_CFG_TARGET_OS (the crate's
+    // actual cross-compile target) — always true when building on a Windows host regardless of
+    // target, so cross-compiling to Android from Windows tried to compile windows.cc with
+    // Windows.h. Never hit upstream because their own Android builds run from Linux/macOS hosts.
+    #[cfg(all(windows, feature = "inline"))]
+    if target_os == "windows" {
+        build_manifest();
+    }
+    #[cfg(windows)]
+    if target_os == "windows" {
+        build_windows();
+    }
     if target_os == "macos" {
         #[cfg(target_os = "macos")]
         build_mac();

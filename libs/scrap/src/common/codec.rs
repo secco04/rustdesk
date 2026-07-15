@@ -1031,9 +1031,25 @@ pub fn codec_thread_num(limit: usize) -> usize {
 }
 
 fn disable_av1() -> bool {
+    // M3 (plans/soft-frolicking-thimble.md): our aom.rs is a STUB ("AV1 decoding deferred") — we
+    // never built the vcpkg aom port for arm64-android. So on Android we must NOT advertise AV1
+    // decode/encode support: otherwise the peer prefers AV1, sends AV1 frames, EVERY one fails to
+    // decode in our stub, and only after `fail_counter` reaches 3 does the client renegotiate down
+    // to VP9 — which then also has to wait for a fresh codec-switch keyframe. Confirmed on-device
+    // via logcat: this exact dance was the "screen stays black for a very long time before the
+    // picture appears" symptom. Forcing AV1 off here makes the peer send VP9 from frame 1 (whose
+    // first frame is already a decodable keyframe), eliminating the whole failed-AV1 detour. The
+    // real long-term fix is to build the aom vcpkg port and un-stub aom.rs.
+    #[cfg(target_os = "android")]
+    {
+        return true;
+    }
     // aom is very slow for x86 sciter version on windows x64
     // disable it for all 32 bit platforms
-    std::mem::size_of::<usize>() == 4
+    #[allow(unreachable_code)]
+    {
+        std::mem::size_of::<usize>() == 4
+    }
 }
 
 #[cfg(not(target_os = "ios"))]

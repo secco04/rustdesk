@@ -1241,7 +1241,23 @@ impl FlutterHandler {
         //
         // 1. "display 1" will not send the event.
         // 2. "displays 0&1" will not send the event. Because it uses texutre render for now.
-        if !is_sent {
+        //
+        // M3 (plans/soft-frolicking-thimble.md): this `!is_sent` branch assumed the ONLY way a
+        // frame ever gets consumed is via a pushed `EventToUI::Rgba` event reaching a live
+        // `event_stream` — so if nothing was notified, it eagerly discards the frame (valid=false)
+        // rather than leave a stale one sitting around forever. `session_start_headless` (see its
+        // own doc) intentionally NEVER sets `event_stream` (no Dart isolate to push to) — so
+        // `is_sent` is unconditionally false for every single frame, and this reset the buffer
+        // back to invalid within the SAME synchronous call that had just marked it valid a few
+        // lines above. Our own polling consumer (`session_get_rgba`/`session_next_rgba`, called
+        // from a separate JNI-side thread) therefore almost never observed `valid == true` — it
+        // would have to race into the handful of nanoseconds between the two writes. Confirmed
+        // on-device: frames were decoding (fps counter updating) but essentially never drawn.
+        // Fix: only discard the frame here if NO session handler exists at all (a truly orphaned
+        // frame nobody could ever consume) — if one exists (headless or not), leave `valid` as the
+        // decoder set it, so a polling consumer without an event stream still gets to read it and
+        // is responsible for invalidating it itself via `session_next_rgba` once actually consumed.
+        if !is_sent && self.session_handlers.read().unwrap().is_empty() {
             if let Some(rgba_data) = self.display_rgbas.write().unwrap().get_mut(&display) {
                 rgba_data.valid = false;
             }
@@ -1411,6 +1427,53 @@ pub fn session_start_(
         if !is_connected && is_first_ui_session {
             log::info!(
                 "Session {} start, use texture render: {}",
+                id,
+                session.use_texture_render.load(Ordering::Relaxed)
+            );
+            let session = (*session).clone();
+            std::thread::spawn(move || {
+                let round = session.connection_round_state.lock().unwrap().new_round();
+                io_loop(session, round);
+            });
+        }
+        Ok(())
+    } else {
+        bail!("No session with peer id {}", id)
+    }
+}
+
+/// M2 (plans/soft-frolicking-thimble.md): small additive function for the android-shim JNI
+/// plugin, which has no Dart isolate and therefore cannot construct a real `StreamSink<EventToUI>`
+/// (it wraps a Dart `MessagePort` obtained from `Dart_NewNativePort_DL`, which requires an actual
+/// running Dart VM to have called `Dart_InitializeApiDL` — there is none here). This mirrors
+/// `session_start_` exactly except it never touches `h.event_stream` (left as whatever
+/// `session_add` already set it to, i.e. `None`) — `io_loop` and everything else already treat a
+/// `None` event_stream as "nothing to push UI events to" and skip sending, so leaving it unset is
+/// safe. Event delivery for a JNI-only caller is done by polling sync functions instead (e.g.
+/// `session_get_rgba`/`session_next_rgba` for video, once M3 gets there).
+pub fn session_start_headless(session_id: &SessionID, id: &str) -> ResultType<()> {
+    let mut is_connected = false;
+    let mut is_found = false;
+    for s in sessions::get_sessions() {
+        if let Some(h) = s.session_handlers.write().unwrap().get_mut(session_id) {
+            is_connected = h.event_stream.is_some();
+            is_found = true;
+            break;
+        }
+    }
+    if !is_found {
+        bail!(
+            "No session with peer id {}, session id: {}",
+            id,
+            session_id.to_string()
+        );
+    }
+
+    if let Some(session) = sessions::get_session_by_session_id(session_id) {
+        let is_first_ui_session = session.session_handlers.read().unwrap().len() == 1;
+        if !is_connected && is_first_ui_session {
+            log::info!(
+                "Session {} start (headless), use texture render: {}",
                 id,
                 session.use_texture_render.load(Ordering::Relaxed)
             );
@@ -1716,6 +1779,23 @@ pub fn session_get_rgba_size(session_id: SessionID, display: usize) -> usize {
             .map_or(0, |rgba| rgba.data.len());
     }
     0
+}
+
+/// M3 (plans/soft-frolicking-thimble.md): synchronous, pollable (width, height) getter for a
+/// headless session's display, added for the same reason as `session_start_headless` — the normal
+/// channel for this (`make_displays_msg`, built from `PeerInfo::displays` and pushed through the
+/// event stream in `set_peer_info`/`set_displays`) is unavailable since `session_start_headless`
+/// never sets `event_stream`. `set_peer_info`/`set_displays` populate `PeerInfo.displays`
+/// unconditionally (the event push is just an extra side effect on top), so the same data can be
+/// read directly here. Returns (0, 0) if the session or that display index isn't known yet (e.g.
+/// called before the peer handshake/first frame).
+pub fn session_get_display_size(session_id: SessionID, display: usize) -> (i32, i32) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        if let Some(d) = session.peer_info.read().unwrap().displays.get(display) {
+            return (d.width, d.height);
+        }
+    }
+    (0, 0)
 }
 
 #[no_mangle]

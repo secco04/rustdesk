@@ -1,4 +1,6 @@
 mod keyboard;
+// M1 experiment (plans/soft-frolicking-thimble.md): see the file's own doc comment.
+mod audio_codec_stub;
 /// cbindgen:ignore
 pub mod platform;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
