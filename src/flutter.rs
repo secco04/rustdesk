@@ -787,6 +787,118 @@ pub fn take_headless_cursor() -> Option<Vec<u8>> {
     Some(out)
 }
 
+// lobishell-android (file transfer): the file-transfer InvokeUiSession callbacks below
+// (`update_folder_files`, `job_progress`, `job_done`, `job_error`, `override_file_confirm`) only
+// ever `push_event(...)`, which is a no-op for a headless session (`session_start_headless` never
+// sets `event_stream`). These queues give our JNI shim a poll-based way to drain those events as
+// JSON strings — same idea as the cursor/clipboard poll caches, but keyed per `SessionID` because
+// a user can plausibly run several independent file-transfer sessions (to different peers) at
+// once, and the file-transfer session is a SEPARATE session from the control/video one anyway.
+//
+// The FlutterHandler methods don't receive a `SessionID`, but a headless file-transfer session's
+// handler has exactly one entry in `session_handlers` (its own ui session), so we recover it via
+// `headless_session_id()` below.
+#[derive(Default)]
+struct HeadlessFtQueues {
+    /// FIFO of directory-listing results, each a JSON string (see `ft_push_dir_listing`).
+    dir_listings: std::collections::VecDeque<String>,
+    /// FIFO of job status events (progress / done / error), each a JSON string.
+    job_events: std::collections::VecDeque<String>,
+    /// Single pending overwrite/resume prompt (clear-on-read). The job blocks until it's answered
+    /// via `session_set_confirm_override_file`, so at most one is outstanding at a time.
+    override_confirm: Option<String>,
+}
+
+// Bounds so a session whose consumer stops polling can't grow these without limit. Directory
+// listings and job events are both low-rate; these caps are generous and only drop the oldest.
+const MAX_FT_DIR_LISTINGS: usize = 64;
+const MAX_FT_JOB_EVENTS: usize = 512;
+
+lazy_static::lazy_static! {
+    static ref HEADLESS_FT: std::sync::Mutex<HashMap<SessionID, HeadlessFtQueues>> =
+        std::sync::Mutex::new(HashMap::new());
+}
+
+fn ft_push_dir_listing(session_id: SessionID, json: String) {
+    let mut map = HEADLESS_FT.lock().unwrap();
+    let q = map.entry(session_id).or_default();
+    q.dir_listings.push_back(json);
+    while q.dir_listings.len() > MAX_FT_DIR_LISTINGS {
+        q.dir_listings.pop_front();
+    }
+}
+
+fn ft_push_job_event(session_id: SessionID, json: String) {
+    let mut map = HEADLESS_FT.lock().unwrap();
+    let q = map.entry(session_id).or_default();
+    q.job_events.push_back(json);
+    while q.job_events.len() > MAX_FT_JOB_EVENTS {
+        q.job_events.pop_front();
+    }
+}
+
+fn ft_set_override_confirm(session_id: SessionID, json: String) {
+    let mut map = HEADLESS_FT.lock().unwrap();
+    map.entry(session_id).or_default().override_confirm = Some(json);
+}
+
+/// lobishell-android: drain the oldest pending directory-listing JSON for `session_id`, or None if
+/// the queue is empty (FIFO clear-on-read, one entry per call).
+pub fn ft_take_dir_listing(session_id: &SessionID) -> Option<String> {
+    HEADLESS_FT
+        .lock()
+        .unwrap()
+        .get_mut(session_id)?
+        .dir_listings
+        .pop_front()
+}
+
+/// lobishell-android: drain the oldest pending job-status JSON for `session_id`, or None if empty.
+pub fn ft_take_job_event(session_id: &SessionID) -> Option<String> {
+    HEADLESS_FT
+        .lock()
+        .unwrap()
+        .get_mut(session_id)?
+        .job_events
+        .pop_front()
+}
+
+/// lobishell-android: take the pending overwrite-confirm prompt for `session_id` (clear-on-read),
+/// or None if none is pending.
+pub fn ft_take_override_confirm(session_id: &SessionID) -> Option<String> {
+    HEADLESS_FT
+        .lock()
+        .unwrap()
+        .get_mut(session_id)?
+        .override_confirm
+        .take()
+}
+
+fn ft_entries_to_json(entries: &Vec<FileEntry>) -> Vec<serde_json::Value> {
+    entries
+        .iter()
+        .map(|e| {
+            json!({
+                // FileType enum int value: 0=Dir, 2=DirLink, 3=DirDrive, 4=File, 5=FileLink.
+                "entry_type": e.entry_type.value(),
+                "name": e.name,
+                "is_hidden": e.is_hidden,
+                "size": e.size,
+                "modified_time": e.modified_time,
+            })
+        })
+        .collect()
+}
+
+impl FlutterHandler {
+    /// lobishell-android: the SessionID of this (headless) handler's single ui session. A
+    /// headless file-transfer session has exactly one entry in `session_handlers`, so returning
+    /// the first key identifies it. Returns None only if called before the handler is registered.
+    fn headless_session_id(&self) -> Option<SessionID> {
+        self.session_handlers.read().unwrap().keys().next().copied()
+    }
+}
+
 impl InvokeUiSession for FlutterHandler {
     fn set_cursor_data(&self, cd: CursorData) {
         let mut colors = hbb_common::compress::decompress(&cd.colors);
@@ -890,6 +1002,19 @@ impl InvokeUiSession for FlutterHandler {
     }
 
     fn job_error(&self, id: i32, err: String, file_num: i32) {
+        // lobishell-android: also queue for the headless poll cache before the (no-op) push_event.
+        if let Some(session_id) = self.headless_session_id() {
+            ft_push_job_event(
+                session_id,
+                json!({
+                    "type": "error",
+                    "id": id,
+                    "file_num": file_num,
+                    "err": err,
+                })
+                .to_string(),
+            );
+        }
         self.push_event(
             "job_error",
             &[
@@ -902,6 +1027,18 @@ impl InvokeUiSession for FlutterHandler {
     }
 
     fn job_done(&self, id: i32, file_num: i32) {
+        // lobishell-android: also queue for the headless poll cache before the (no-op) push_event.
+        if let Some(session_id) = self.headless_session_id() {
+            ft_push_job_event(
+                session_id,
+                json!({
+                    "type": "done",
+                    "id": id,
+                    "file_num": file_num,
+                })
+                .to_string(),
+            );
+        }
         self.push_event(
             "job_done",
             &[("id", &id.to_string()), ("file_num", &file_num.to_string())],
@@ -924,6 +1061,22 @@ impl InvokeUiSession for FlutterHandler {
         #[allow(unused_variables)] is_local: bool,
         only_count: bool,
     ) {
+        // lobishell-android: also queue the listing for the headless poll cache before the (no-op)
+        // push_event below. Covers both a real remote listing (`is_local == false`) and the
+        // local-preview count that a read job emits (`is_local == true`, `only_count == true`).
+        if let Some(session_id) = self.headless_session_id() {
+            ft_push_dir_listing(
+                session_id,
+                json!({
+                    "id": id,
+                    "path": path,
+                    "is_local": is_local,
+                    "only_count": only_count,
+                    "entries": ft_entries_to_json(entries),
+                })
+                .to_string(),
+            );
+        }
         // TODO opt
         if only_count {
             self.push_event(
@@ -971,6 +1124,22 @@ impl InvokeUiSession for FlutterHandler {
         is_upload: bool,
         is_identical: bool,
     ) {
+        // lobishell-android: stash the prompt for the headless poll cache (clear-on-read) before
+        // the (no-op) push_event. The job blocks until answered via
+        // `session_set_confirm_override_file`, so a single pending slot is correct.
+        if let Some(session_id) = self.headless_session_id() {
+            ft_set_override_confirm(
+                session_id,
+                json!({
+                    "id": id,
+                    "file_num": file_num,
+                    "to": to,
+                    "is_upload": is_upload,
+                    "is_identical": is_identical,
+                })
+                .to_string(),
+            );
+        }
         self.push_event(
             "override_file_confirm",
             &[
@@ -985,6 +1154,20 @@ impl InvokeUiSession for FlutterHandler {
     }
 
     fn job_progress(&self, id: i32, file_num: i32, speed: f64, finished_size: f64) {
+        // lobishell-android: also queue for the headless poll cache before the (no-op) push_event.
+        if let Some(session_id) = self.headless_session_id() {
+            ft_push_job_event(
+                session_id,
+                json!({
+                    "type": "progress",
+                    "id": id,
+                    "file_num": file_num,
+                    "speed": speed,
+                    "finished_size": finished_size,
+                })
+                .to_string(),
+            );
+        }
         self.push_event(
             "job_progress",
             &[
