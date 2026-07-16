@@ -661,9 +661,145 @@ impl FlutterHandler {
     }
 }
 
+// lobishell-android (host cursor shape): `set_cursor_data`/`set_cursor_id` below only ever
+// `push_event(...)`, which is a no-op for a headless session — `session_start_headless`
+// deliberately never sets `event_stream` (no Dart isolate to push to), so the peer's cursor
+// shapes were decoded and then dropped on the floor. These statics give our JNI shim a
+// poll-based way to observe them, exactly like `scrap::android::ffi`'s clipboard buffers
+// (`set_remote_clipboard_text`/`take_remote_clipboard_text`) do for clipboard text.
+//
+// GLOBAL rather than per-session (same tradeoff the clipboard buffers already make): the shim
+// only ever drives one active session at a time, and threading a SessionID through here would
+// mean plumbing it into `InvokeUiSession`, whose methods take `&self` on a handler that doesn't
+// know its own session id. `take_headless_cursor` therefore ignores which session asked.
+//
+// The cache is required, not an optimization: the peer sends a full `CursorData` shape ONCE per
+// distinct cursor and thereafter refers back to it by id via `CursorId`. Without keeping the
+// shapes, every `CursorId` would leave us with nothing to draw.
+struct HeadlessCursorShape {
+    width: i32,
+    height: i32,
+    hotx: i32,
+    hoty: i32,
+    /// Decompressed RGBA, 4 bytes/pixel, `width * height * 4` long.
+    colors: Vec<u8>,
+}
+
+struct HeadlessCursorState {
+    shapes: HashMap<u64, HeadlessCursorShape>,
+    /// Insertion order, used to evict the oldest shape once `MAX_HEADLESS_CURSOR_SHAPES` is hit
+    /// so a long session can't grow `shapes` without bound. Hosts cycle through a modest set of
+    /// cursors, so eviction should be rare in practice; if an evicted id is later referenced by a
+    /// `CursorId`, we report nothing rather than drawing garbage.
+    order: std::collections::VecDeque<u64>,
+    /// Id of the cursor the peer says is currently shown, if its shape is known.
+    current: Option<u64>,
+    /// Set whenever `current` changes (or its shape is redefined); cleared by
+    /// `take_headless_cursor`, giving the same clear-on-read semantics as `getFrame`'s rgba
+    /// buffer — the caller polls on its video loop and only rebuilds its Bitmap on a change.
+    dirty: bool,
+}
+
+const MAX_HEADLESS_CURSOR_SHAPES: usize = 32;
+
+lazy_static::lazy_static! {
+    static ref HEADLESS_CURSOR: std::sync::Mutex<HeadlessCursorState> =
+        std::sync::Mutex::new(HeadlessCursorState {
+            shapes: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            current: None,
+            dirty: false,
+        });
+}
+
+/// lobishell-android: caches a decompressed cursor shape by id and marks it current. Called from
+/// `set_cursor_data` (see `HeadlessCursorShape`'s doc above for why).
+fn cache_headless_cursor(cd: &CursorData, colors: Vec<u8>) {
+    let mut state = HEADLESS_CURSOR.lock().unwrap();
+    let is_new = state
+        .shapes
+        .insert(
+            cd.id,
+            HeadlessCursorShape {
+                width: cd.width,
+                height: cd.height,
+                hotx: cd.hotx,
+                hoty: cd.hoty,
+                colors,
+            },
+        )
+        .is_none();
+    if is_new {
+        state.order.push_back(cd.id);
+        while state.order.len() > MAX_HEADLESS_CURSOR_SHAPES {
+            match state.order.pop_front() {
+                // Never evict the shape we're currently showing.
+                Some(old) if Some(old) == state.current => {
+                    state.order.push_back(old);
+                    break;
+                }
+                Some(old) => {
+                    state.shapes.remove(&old);
+                }
+                None => break,
+            }
+        }
+    }
+    state.current = Some(cd.id);
+    state.dirty = true;
+}
+
+/// lobishell-android: marks an already-cached shape current. Called from `set_cursor_id`. An id
+/// we've never seen a `CursorData` for (or whose shape was evicted) leaves `current` untouched
+/// rather than blanking the cursor.
+fn select_headless_cursor(id: u64) {
+    let mut state = HEADLESS_CURSOR.lock().unwrap();
+    if !state.shapes.contains_key(&id) {
+        return;
+    }
+    if state.current != Some(id) {
+        state.current = Some(id);
+        state.dirty = true;
+    }
+}
+
+/// lobishell-android: takes the current cursor if it changed since the last call, packed for the
+/// JNI shim as 4 little-endian i32s (`width`, `height`, `hotx`, `hoty`) followed by
+/// `width * height * 4` bytes of RGBA pixel data. Returns None when unchanged (or when nothing is
+/// known yet), i.e. clear-on-read polling — same contract as `take_remote_clipboard_text`.
+pub fn take_headless_cursor() -> Option<Vec<u8>> {
+    let mut state = HEADLESS_CURSOR.lock().unwrap();
+    if !state.dirty {
+        return None;
+    }
+    let id = state.current?;
+    let out = {
+        let shape = state.shapes.get(&id)?;
+        let mut out = Vec::with_capacity(16 + shape.colors.len());
+        out.extend_from_slice(&shape.width.to_le_bytes());
+        out.extend_from_slice(&shape.height.to_le_bytes());
+        out.extend_from_slice(&shape.hotx.to_le_bytes());
+        out.extend_from_slice(&shape.hoty.to_le_bytes());
+        out.extend_from_slice(&shape.colors);
+        out
+    };
+    state.dirty = false;
+    Some(out)
+}
+
 impl InvokeUiSession for FlutterHandler {
     fn set_cursor_data(&self, cd: CursorData) {
-        let colors = hbb_common::compress::decompress(&cd.colors);
+        let mut colors = hbb_common::compress::decompress(&cd.colors);
+        // lobishell-android: same workaround src/ui/remote.rs's SciterHandler::set_cursor_data
+        // applies ("somehow all 0 images shows black rect") — an all-zero (fully transparent)
+        // buffer renders as an opaque black rectangle, so nudge one alpha byte.
+        if colors.len() > 3 && colors.iter().filter(|x| **x != 0).next().is_none() {
+            log::info!("Fix transparent");
+            colors[3] = 1;
+        }
+        // lobishell-android: cache the shape for our poll-based JNI getter before the (headless
+        // no-op) push_event below, which is left intact so a future non-headless use still works.
+        cache_headless_cursor(&cd, colors.clone());
         self.push_event(
             "cursor_data",
             &[
@@ -682,6 +818,11 @@ impl InvokeUiSession for FlutterHandler {
     }
 
     fn set_cursor_id(&self, id: String) {
+        // lobishell-android: the peer refers back to an already-sent shape by id — select it in
+        // our cache so the headless getter reports the right cursor (see cache_headless_cursor).
+        if let Ok(id) = id.parse::<u64>() {
+            select_headless_cursor(id);
+        }
         self.push_event("cursor_id", &[("id", &id.to_string())], &[]);
     }
 
