@@ -1465,6 +1465,16 @@ impl<T: InvokeUiSession> Remote<T> {
                         let lc = self.handler.lc.read().unwrap();
                         !lc.disable_clipboard.v && !lc.view_only.v
                     };
+                    // lobishell-android diagnostic (Round 24): confirm whether the peer even sends
+                    // this message at all, and whether our own disable_clipboard/view_only defaults
+                    // are gating it before it ever reaches handle_msg_clipboard.
+                    #[cfg(target_os = "android")]
+                    log::info!(
+                        "lobishell: received Clipboard message, clipboard_allowed={}, format={:?}, len={}",
+                        clipboard_allowed,
+                        cb.format,
+                        cb.content.len()
+                    );
                     if clipboard_allowed {
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         update_clipboard(vec![cb], ClipboardSide::Client);
@@ -1488,6 +1498,14 @@ impl<T: InvokeUiSession> Remote<T> {
                         let lc = self.handler.lc.read().unwrap();
                         !lc.disable_clipboard.v && !lc.view_only.v
                     };
+                    // lobishell-android diagnostic (Round 24): same reasoning as the single-Clipboard
+                    // arm above.
+                    #[cfg(target_os = "android")]
+                    log::info!(
+                        "lobishell: received MultiClipboards message, clipboard_allowed={}, count={}",
+                        clipboard_allowed,
+                        _mcb.clipboards.len()
+                    );
                     if clipboard_allowed {
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         update_clipboard(_mcb.clipboards, ClipboardSide::Client);

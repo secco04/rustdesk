@@ -782,9 +782,15 @@ pub fn handle_msg_clipboard(mut cb: Clipboard) {
     // call below is a no-op for us (no Java ClipboardManager object registered, see that function's
     // doc), so without this the received clipboard content would silently go nowhere.
     if cb.format.enum_value() == Ok(hbb_common::message_proto::ClipboardFormat::Text) {
-        if let Ok(text) = String::from_utf8(cb.content.to_vec()) {
-            scrap::android::ffi::set_remote_clipboard_text(text);
+        match String::from_utf8(cb.content.to_vec()) {
+            Ok(text) => {
+                log::info!("lobishell: handle_msg_clipboard extracted {} chars of text", text.len());
+                scrap::android::ffi::set_remote_clipboard_text(text);
+            }
+            Err(e) => log::warn!("lobishell: handle_msg_clipboard content wasn't valid utf8: {}", e),
         }
+    } else {
+        log::info!("lobishell: handle_msg_clipboard got non-text format {:?}, ignoring", cb.format);
     }
     let multi_clips = MultiClipboards {
         clipboards: vec![cb],
@@ -811,9 +817,15 @@ pub fn handle_msg_multi_clipboards(mut mcb: MultiClipboards) {
         .iter()
         .find(|c| c.format.enum_value() == Ok(hbb_common::message_proto::ClipboardFormat::Text))
     {
-        if let Ok(text) = String::from_utf8(text_cb.content.to_vec()) {
-            scrap::android::ffi::set_remote_clipboard_text(text);
+        match String::from_utf8(text_cb.content.to_vec()) {
+            Ok(text) => {
+                log::info!("lobishell: handle_msg_multi_clipboards extracted {} chars of text", text.len());
+                scrap::android::ffi::set_remote_clipboard_text(text);
+            }
+            Err(e) => log::warn!("lobishell: handle_msg_multi_clipboards content wasn't valid utf8: {}", e),
         }
+    } else {
+        log::info!("lobishell: handle_msg_multi_clipboards found no Text-format clip among {} entries", mcb.clipboards.len());
     }
     if let Ok(bytes) = mcb.write_to_bytes() {
         let _ = scrap::android::ffi::call_clipboard_manager_update_clipboard(&bytes);
