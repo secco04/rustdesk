@@ -132,7 +132,7 @@ pub fn get_clipboards(client: bool) -> Option<MultiClipboards> {
 pub fn push_outgoing_clipboard_text(text: String) {
     use hbb_common::message_proto::{Clipboard, ClipboardFormat};
     let cb = Clipboard {
-        content: bytes::Bytes::from(text.into_bytes()),
+        content: text.into_bytes().into(),
         format: hbb_common::protobuf::EnumOrUnknown::new(ClipboardFormat::Text),
         ..Default::default()
     };
