@@ -2322,6 +2322,27 @@ pub fn session_default_privacy_mode_impl(session_id: SessionID) -> String {
         .to_string()
 }
 
+/// View Camera (plans/soft-frolicking-thimble.md): whether the connected peer advertised a camera
+/// to view, via `PeerInfo.platform_additions`'s own `"support_view_camera": true/false` flag (same
+/// cache as `session_default_privacy_mode_impl` above reads its own key from — `set_peer_info`
+/// unconditionally populates `session.peer_info` for every headless session regardless of
+/// push_event). Meant to be read on the already-open CONTROL session (not a dedicated view-camera
+/// session, which won't have peer_info populated until it's connected) to decide whether to show a
+/// "View Camera" entry point at all before opening the second, dedicated session.
+pub fn session_is_view_camera_supported(session_id: SessionID) -> bool {
+    let Some(session) = sessions::get_session_by_session_id(&session_id) else {
+        return false;
+    };
+    let platform_additions = session.peer_info.read().unwrap().platform_additions.clone();
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&platform_additions) else {
+        return false;
+    };
+    parsed
+        .get("support_view_camera")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// Pre-connect online check (lobishell-android): queries the rendezvous server directly for
 /// whether `id` is currently online, without needing a session at all. RustDesk's own public
 /// `client::peer_online::query_online_states` wrapper delivers its result through
