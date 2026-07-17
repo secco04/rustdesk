@@ -2274,6 +2274,54 @@ pub fn session_get_display_count(session_id: SessionID) -> i32 {
     0
 }
 
+/// Privacy mode (plans/soft-frolicking-thimble.md): whether the connected peer advertised support
+/// for it at all (`PeerInfo.features.privacy_mode`, the same field RustDesk's own Flutter UI reads
+/// via `set_peer_info`'s push_event — `set_peer_info` already unconditionally caches the peer's
+/// whole PeerInfo into `session.peer_info` regardless of push_event succeeding, same as
+/// `session_get_display_size` above reads `.displays` from the same cache). No new patch needed —
+/// `session_toggle_privacy_mode` (below) and the toggle-state getter already exist upstream in
+/// `flutter_ffi.rs`/`client.rs`; this is the one missing piece, "does the peer even support it."
+pub fn session_is_privacy_mode_supported(session_id: SessionID) -> bool {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        return session
+            .peer_info
+            .read()
+            .unwrap()
+            .features
+            .iter()
+            .next()
+            .map(|f| f.privacy_mode)
+            .unwrap_or(false);
+    }
+    false
+}
+
+/// The first privacy-mode implementation key the peer advertised supporting (from
+/// `PeerInfo.platform_additions`'s own `"supported_privacy_mode_impl": [[impl_key, tip_key], ...]`
+/// list — confirmed via a real on-device PeerInfo dump this session, not guessed), or an empty
+/// string if none/not yet known. `toggle_privacy_mode` needs a specific impl_key — RustDesk's own
+/// Flutter UI lets the user pick among several when more than one is offered; this headless client
+/// just uses whichever the peer lists first, a reasonable default absent any UI to choose
+/// otherwise.
+pub fn session_default_privacy_mode_impl(session_id: SessionID) -> String {
+    let Some(session) = sessions::get_session_by_session_id(&session_id) else {
+        return String::new();
+    };
+    let platform_additions = session.peer_info.read().unwrap().platform_additions.clone();
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&platform_additions) else {
+        return String::new();
+    };
+    parsed
+        .get("supported_privacy_mode_impl")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|entry| entry.as_array())
+        .and_then(|pair| pair.first())
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Pre-connect online check (lobishell-android): queries the rendezvous server directly for
 /// whether `id` is currently online, without needing a session at all. RustDesk's own public
 /// `client::peer_online::query_online_states` wrapper delivers its result through
