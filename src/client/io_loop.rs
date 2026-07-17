@@ -83,6 +83,9 @@ pub struct Remote<T: InvokeUiSession> {
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
     sent_close_reason: bool,
+    // Audio (plans/soft-frolicking-thimble.md): diagnostic counter, see the AudioFrame arm above.
+    #[cfg(target_os = "android")]
+    audio_frame_count: u64,
 }
 
 #[derive(Default)]
@@ -132,6 +135,8 @@ impl<T: InvokeUiSession> Remote<T> {
             chroma: Default::default(),
             last_record_state: false,
             sent_close_reason: false,
+            #[cfg(target_os = "android")]
+            audio_frame_count: 0,
         }
     }
 
@@ -2048,6 +2053,24 @@ impl<T: InvokeUiSession> Remote<T> {
                     self.handler.handle_test_delay(t, peer).await;
                 }
                 Some(message::Union::AudioFrame(frame)) => {
+                    // Audio (plans/soft-frolicking-thimble.md): diagnostics for the "format
+                    // arrives but no sound" investigation — logs whether AudioFrame messages
+                    // reach the client AT ALL (over the wire, upstream of decode) and whether
+                    // this client's own mute gate is dropping them, since neither was previously
+                    // visible in any log. Android-only, rate-limited (frames arrive continuously).
+                    #[cfg(target_os = "android")]
+                    {
+                        self.audio_frame_count += 1;
+                        let muted = self.handler.lc.read().unwrap().disable_audio.v;
+                        if self.audio_frame_count == 1 || self.audio_frame_count % 100 == 0 {
+                            log::warn!(
+                                "AudioFrame #{} received ({} bytes), disable_audio.v={}",
+                                self.audio_frame_count,
+                                frame.data.len(),
+                                muted
+                            );
+                        }
+                    }
                     if !self.handler.lc.read().unwrap().disable_audio.v {
                         self.audio_sender
                             .send(MediaData::AudioFrame(Box::new(frame)))
