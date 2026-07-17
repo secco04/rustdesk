@@ -1194,6 +1194,13 @@ pub struct AudioHandler {
     device_channel: u16,
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     ready: Arc<std::sync::Mutex<bool>>,
+    // Audio (plans/soft-frolicking-thimble.md): diagnostics for the Android decode path — logged
+    // once (success) / rate-limited (errors) rather than per-frame, since frames arrive every
+    // ~20-60ms and per-frame logging would flood logcat instantly.
+    #[cfg(target_os = "android")]
+    logged_first_decode: bool,
+    #[cfg(target_os = "android")]
+    decode_error_count: u32,
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -1439,8 +1446,36 @@ impl AudioHandler {
             log::debug!("PulseAudio simple binding does not exists");
             return;
         }
-        self.audio_decoder.as_mut().map(|(d, buffer)| {
-            if let Ok(n) = d.decode_float(&frame.data, buffer, false) {
+        // Not a closure (unlike the original `.map(|(d, buffer)| ...)`) specifically so the Android
+        // diagnostic branches below can freely reference other `self` fields (decode_error_count,
+        // logged_first_decode) alongside `d`/`buffer` without a closure-capture borrow conflict.
+        if let Some((d, buffer)) = self.audio_decoder.as_mut() {
+            let decode_result = d.decode_float(&frame.data, buffer, false);
+            #[cfg(target_os = "android")]
+            if let Err(e) = &decode_result {
+                self.decode_error_count += 1;
+                // Every frame while erroring would flood logcat (frames arrive every ~20-60ms) —
+                // log the first one immediately (so a broken decode is visible right away) then
+                // every ~100th after that (so a persistent problem still stays visible, throttled).
+                if self.decode_error_count == 1 || self.decode_error_count % 100 == 0 {
+                    log::warn!(
+                        "Android audio decode_float failed (#{}, input {} bytes): {}",
+                        self.decode_error_count,
+                        frame.data.len(),
+                        e
+                    );
+                }
+            }
+            if let Ok(n) = decode_result {
+                #[cfg(target_os = "android")]
+                if !self.logged_first_decode {
+                    self.logged_first_decode = true;
+                    log::info!(
+                        "Android audio: first successful decode ({} samples/channel, {} channels)",
+                        n,
+                        self.channels
+                    );
+                }
                 let channels = self.channels;
                 let n = n * (channels as usize);
                 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -1483,7 +1518,7 @@ impl AudioHandler {
                     crate::flutter::push_headless_audio_pcm(&buffer[0..n]);
                 }
             }
-        });
+        }
     }
 
     /// Build audio output stream for current device.
