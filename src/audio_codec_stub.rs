@@ -61,23 +61,28 @@ impl Decoder {
         let channels = channels.count();
         let inner = opus_rs::OpusDecoder::new(sample_rate as i32, channels)
             .map_err(|e| OpusError(e.to_string()))?;
-        // The Opus spec caps any single frame at 120ms — libopus itself documents 120ms as the
-        // right size to request when the caller doesn't know the packet's real duration up
-        // front (our case exactly: `output` is a whole-second scratch buffer, not sized to one
-        // frame). opus-rs's own `decode()` was found (via a real panic, not guessed) to
-        // internally bound its work to a max-single-frame-sized buffer derived from whatever
-        // `frame_size` it's given — requesting far more (our old `output.len() / channels`,
-        // effectively a full second) overflowed that internal buffer:
-        // "range end index 96000 out of range for slice of length 11520" — 11520 = 5760 * 2
-        // channels, i.e. exactly 120ms at 48kHz, confirming this cap is what opus-rs expects.
-        let max_frame_samples = (sample_rate as usize * 120) / 1000;
+        // First fix (120ms, the Opus spec's documented max single-frame duration) stopped the
+        // panic ("range end index 96000 out of range for slice of length 11520" — 11520 = 5760*2
+        // channels = 120ms at 48kHz, confirming opus-rs bounds its work to whatever frame_size it
+        // gets) but didn't fix playback: decode then reported n=5760 samples/channel for EVERY
+        // packet regardless of actual size (confirmed via the "first successful decode" log), even
+        // though `server/audio_service.rs`'s own encoder (this same repo, the RustDesk protocol's
+        // authoritative sender) fixes `frame_size = sample_rate / 100` — exactly 10ms, ALWAYS,
+        // never 120ms. opus-rs apparently echoes back whatever frame_size it was asked for rather
+        // than the packet's true decoded length when given a generously large one — every call was
+        // silently padding ~11x more samples than were real, mostly stale/uninitialized leftover
+        // buffer content, explaining "no audible sound despite a technically-working pipeline"
+        // exactly. Matching the encoder's own fixed 10ms exactly removes the ambiguity: real and
+        // requested frame size are now identical, so whatever convention opus-rs follows, the
+        // result is correct either way.
+        let max_frame_samples = sample_rate as usize / 100;
         Ok(Self { inner, channels, max_frame_samples })
     }
 
     /// Matches magnum_opus's real signature exactly: `output`'s length bounds how many
     /// interleaved samples (across all channels) CAN be written, but the `frame_size` opus-rs
-    /// actually wants is the Opus spec's own max single-frame duration (120ms) — see `new`'s doc
-    /// for why passing the full output capacity panics instead of erroring cleanly.
+    /// actually wants is the REAL per-packet duration RustDesk's own encoder always uses (10ms —
+    /// see `new`'s doc for why a generously large guess broke playback instead of just being safe).
     pub fn decode_float(
         &mut self,
         input: &[u8],
