@@ -848,6 +848,78 @@ pub fn take_headless_audio_pcm(max_samples: usize) -> Vec<f32> {
     state.pcm.drain(0..n).collect()
 }
 
+// ---------------------------------------------------------------------------------------------
+// lobishell-android (auto quality / connection stats): `update_quality_status` already fires
+// periodically with everything an adaptive-quality heuristic or a latency/bandwidth readout
+// needs — `delay`/`target_bitrate` from the server's own TestDelay ping-pong (roughly every few
+// seconds, see ui_session_interface.rs's handle_test_delay), `speed`/`fps`/`codec_format`/`chroma`
+// from a separate ~1s stats tick (client/io_loop.rs). Nothing new needs to be requested from the
+// peer — this cache just gets the data OUT of the no-op push_event path, same as cursor/clipboard/
+// audio before it. LATEST-VALUE overwrite (not a queue — only the current status matters), with
+// per-field MERGE rather than wholesale replacement: the two update sites above each only ever
+// populate a subset of QualityStatus's fields (`..Default::default()` for the rest), so a
+// `delay`-only update must not blank out the `speed`/`fps` fields the OTHER call site set most
+// recently, and vice versa.
+#[derive(Default, Clone)]
+struct HeadlessQualityStatus {
+    speed: Option<String>,
+    fps: Option<i32>,
+    delay: Option<i32>,
+    target_bitrate: Option<i32>,
+    codec_format: Option<String>,
+}
+
+lazy_static::lazy_static! {
+    static ref HEADLESS_QUALITY: std::sync::Mutex<HeadlessQualityStatus> =
+        std::sync::Mutex::new(HeadlessQualityStatus::default());
+}
+
+fn push_headless_quality_status(status: &QualityStatus) {
+    let mut state = HEADLESS_QUALITY.lock().unwrap();
+    if status.speed.is_some() {
+        state.speed = status.speed.clone();
+    }
+    // Only one display in this headless client (see session_get_display_size's own single-display
+    // framing) — take whichever fps value is present rather than exposing the whole per-display map.
+    if let Some(fps) = status.fps.values().next() {
+        state.fps = Some(*fps);
+    }
+    if status.delay.is_some() {
+        state.delay = status.delay;
+    }
+    if status.target_bitrate.is_some() {
+        state.target_bitrate = status.target_bitrate;
+    }
+    if status.codec_format.is_some() {
+        state.codec_format = status.codec_format.map(|f| f.to_string());
+    }
+}
+
+/// lobishell-android: the latest known connection stats as a JSON object, or `"{}"` if nothing has
+/// arrived yet. Any field not yet known is simply omitted (not written as `null`), so the caller
+/// can treat a missing key exactly like "unknown" without a separate null-check. Layout:
+/// `{"speed":"1.2MB/s","fps":30,"delay":45,"target_bitrate":2000,"codec_format":"VP9"}`.
+pub fn take_headless_quality_status() -> String {
+    let state = HEADLESS_QUALITY.lock().unwrap().clone();
+    let mut obj = serde_json::Map::new();
+    if let Some(speed) = state.speed {
+        obj.insert("speed".to_string(), serde_json::Value::String(speed));
+    }
+    if let Some(fps) = state.fps {
+        obj.insert("fps".to_string(), serde_json::Value::from(fps));
+    }
+    if let Some(delay) = state.delay {
+        obj.insert("delay".to_string(), serde_json::Value::from(delay));
+    }
+    if let Some(target_bitrate) = state.target_bitrate {
+        obj.insert("target_bitrate".to_string(), serde_json::Value::from(target_bitrate));
+    }
+    if let Some(codec_format) = state.codec_format {
+        obj.insert("codec_format".to_string(), serde_json::Value::String(codec_format));
+    }
+    serde_json::Value::Object(obj).to_string()
+}
+
 // lobishell-android (file transfer): the file-transfer InvokeUiSession callbacks below
 // (`update_folder_files`, `job_progress`, `job_done`, `job_error`, `override_file_confirm`) only
 // ever `push_event(...)`, which is a no-op for a headless session (`session_start_headless` never
@@ -1022,6 +1094,13 @@ impl InvokeUiSession for FlutterHandler {
     fn close_success(&self) {}
 
     fn update_quality_status(&self, status: QualityStatus) {
+        // lobishell-android (auto quality / connection stats): also cache the latest status for
+        // the headless poll consumer before the (no-op) push_event below — see
+        // `push_headless_quality_status`'s doc. RustDesk already sends everything an auto-quality
+        // heuristic needs for free: `delay`/`target_bitrate` arrive periodically via the server's
+        // own TestDelay ping-pong (see ui_session_interface.rs's handle_test_delay), `speed`/`fps`
+        // via a separate ~1s stats tick (client/io_loop.rs) — nothing new to request from the peer.
+        push_headless_quality_status(&status);
         const NULL: String = String::new();
         self.push_event(
             "update_quality_status",
