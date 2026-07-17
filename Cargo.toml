@@ -64,6 +64,11 @@ parity-tokio-ipc = { git = "https://github.com/rustdesk-org/parity-tokio-ipc" }
 # --target/--sysroot clang args that 0.59 doesn't forward the same way). Audio was already out of
 # scope for M1-M4 per the plan, so deferring this matches the plan rather than fighting versions.
 # magnum-opus = { git = "https://github.com/rustdesk-org/magnum-opus" }
+# Audio (plans/soft-frolicking-thimble.md): pure-Rust Opus decode (RFC 6716, ported from libopus
+# 1.6, no C/bindgen dependency at all) — sidesteps the exact class of NDK-cross-compile/bindgen-
+# version problem that blocked magnum-opus/kcp-sys/aom/oboe in earlier rounds. Used only for DECODE
+# (audio_codec_stub.rs's Encoder half stays stubbed — this app never sends audio, only receives it).
+opus-rs = "0.1"
 dasp = { version = "0.11", features = ["signal", "interpolate-linear", "interpolate"], optional = true }
 rubato = { version = "0.12", optional = true }
 samplerate = { version = "0.2", optional = true }

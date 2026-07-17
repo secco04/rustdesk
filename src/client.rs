@@ -1348,12 +1348,16 @@ impl AudioHandler {
         Ok(())
     }
 
-    // M2 (plans/soft-frolicking-thimble.md): audio playback deferred on Android (cpal's Android
-    // backend needs oboe, which has real ABI incompatibilities with NDK r30 — see Cargo.toml's
-    // cpal dependency comment). No-op for now; audio_decoder is already stubbed too, see
-    // src/audio_codec_stub.rs.
+    // Audio (plans/soft-frolicking-thimble.md, "Audio" round): cpal's Android backend still needs
+    // oboe, which has real ABI incompatibilities with NDK r30 (see Cargo.toml's cpal dependency
+    // comment) — that part of M2's deferral stands. But decoding is no longer the blocker it was
+    // (audio_codec_stub.rs's Decoder is now real, via a pure-Rust Opus crate needing no native lib
+    // at all), so playback is wired here WITHOUT cpal: push the negotiated format into the
+    // headless poll cache (crate::flutter) instead of opening a cpal output stream — the JNI shim
+    // polls it and (re)builds an android.media.AudioTrack Kotlin-side.
     #[cfg(target_os = "android")]
-    fn start_audio(&mut self, _format0: AudioFormat) -> ResultType<()> {
+    fn start_audio(&mut self, format0: AudioFormat) -> ResultType<()> {
+        crate::flutter::push_headless_audio_format(format0.sample_rate, format0.channels as u16);
         Ok(())
     }
 
@@ -1468,6 +1472,15 @@ impl AudioHandler {
                     let data_u8 =
                         unsafe { std::slice::from_raw_parts::<u8>(buffer.as_ptr() as _, n * 4) };
                     self.simple.as_mut().map(|x| x.write(data_u8));
+                }
+                // Audio (plans/soft-frolicking-thimble.md): no resample/rechannel step needed here
+                // unlike the cpal platforms above — there's no fixed "device" sample rate/channel
+                // count to match on Android, since playback happens through a Kotlin AudioTrack
+                // built fresh (see NativeBridge.pollAudioFormat) to whatever format the peer
+                // actually negotiated. Push the decoded samples as-is.
+                #[cfg(target_os = "android")]
+                {
+                    crate::flutter::push_headless_audio_pcm(&buffer[0..n]);
                 }
             }
         });

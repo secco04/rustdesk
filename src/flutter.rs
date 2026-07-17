@@ -787,6 +787,67 @@ pub fn take_headless_cursor() -> Option<Vec<u8>> {
     Some(out)
 }
 
+// ---------------------------------------------------------------------------------------------
+// lobishell-android (audio playback, plans/soft-frolicking-thimble.md "Audio" round):
+// `AudioHandler::handle_frame` (client.rs) decodes each incoming `AudioFrame` into f32 PCM on ITS
+// OWN dedicated thread (`client::start_audio_thread`) — a thread the headless setup gets for
+// free, since nothing in that code path goes through `InvokeUiSession`/`push_event` at all (unlike
+// video/cursor/clipboard, which needed the poll-cache workaround specifically because their
+// natural path IS push_event). What's still missing headless is a way to get the decoded PCM (and
+// the negotiated sample rate/channel count, which can change mid-session) OUT to the JNI shim —
+// this cache provides that. Global rather than per-session, same tradeoff as the cursor/clipboard
+// caches: only one active control session drives audio at a time in this app.
+// ---------------------------------------------------------------------------------------------
+struct HeadlessAudioState {
+    /// Set whenever the negotiated format changes; cleared by `take_headless_audio_format`.
+    format: Option<(u32, u16)>,
+    /// Flat interleaved PCM sample queue — matches magnum_opus/opus-rs's own decode_float output
+    /// shape directly, no repacking needed on the push side.
+    pcm: std::collections::VecDeque<f32>,
+}
+
+// ~2s of 48kHz stereo audio: generous headroom for a Kotlin poll thread that's briefly stalled
+// (e.g. a GC pause), small enough that a genuinely stuck consumer can't grow this unbounded.
+const MAX_HEADLESS_AUDIO_SAMPLES: usize = 48_000 * 2 * 2;
+
+lazy_static::lazy_static! {
+    static ref HEADLESS_AUDIO: std::sync::Mutex<HeadlessAudioState> =
+        std::sync::Mutex::new(HeadlessAudioState { format: None, pcm: std::collections::VecDeque::new() });
+}
+
+/// lobishell-android: called from `AudioHandler::handle_format` (client.rs, Android branch) when
+/// the peer's audio format is (re)negotiated.
+pub fn push_headless_audio_format(sample_rate: u32, channels: u16) {
+    HEADLESS_AUDIO.lock().unwrap().format = Some((sample_rate, channels));
+}
+
+/// lobishell-android: called from `AudioHandler::handle_frame` (client.rs, Android branch) with
+/// each frame's decoded PCM. Drops the OLDEST samples on overflow rather than the newest — smooth
+/// continuous playback needs continuity more than completeness, the same tradeoff any live audio
+/// ring buffer makes under backpressure.
+pub fn push_headless_audio_pcm(samples: &[f32]) {
+    let mut state = HEADLESS_AUDIO.lock().unwrap();
+    state.pcm.extend(samples.iter().copied());
+    while state.pcm.len() > MAX_HEADLESS_AUDIO_SAMPLES {
+        state.pcm.pop_front();
+    }
+}
+
+/// lobishell-android: clear-on-change poll for the negotiated format — returns `(sample_rate,
+/// channels)` once right after it's (re)set, then `None` until it changes again. The JNI shim
+/// (re)builds its `AudioTrack` whenever this returns non-null.
+pub fn take_headless_audio_format() -> Option<(u32, u16)> {
+    HEADLESS_AUDIO.lock().unwrap().format.take()
+}
+
+/// lobishell-android: drains up to `max_samples` interleaved PCM samples (FIFO order), or an
+/// empty Vec if none are pending yet.
+pub fn take_headless_audio_pcm(max_samples: usize) -> Vec<f32> {
+    let mut state = HEADLESS_AUDIO.lock().unwrap();
+    let n = max_samples.min(state.pcm.len());
+    state.pcm.drain(0..n).collect()
+}
+
 // lobishell-android (file transfer): the file-transfer InvokeUiSession callbacks below
 // (`update_folder_files`, `job_progress`, `job_done`, `job_error`, `override_file_confirm`) only
 // ever `push_event(...)`, which is a no-op for a headless session (`session_start_headless` never
