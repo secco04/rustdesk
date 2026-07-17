@@ -291,6 +291,12 @@ impl<T: InvokeUiSession> Remote<T> {
                                     break;
                                 }
                                 self.update_jobs_status();
+                            } else if !self.write_jobs.is_empty() {
+                                // lobishell-android: see the write_jobs.push() comment above — an
+                                // upload-only tick has no read_jobs work to do, but write_jobs still
+                                // needs its periodic job_progress report, and the timer must stay
+                                // fast (not fall through to the 30s reset below) while one is active.
+                                self.update_jobs_status();
                             } else {
                                 self.timer = crate::rustdesk_interval(time::interval_at(Instant::now() + SEC30, SEC30));
                             }
@@ -617,6 +623,13 @@ impl<T: InvokeUiSession> Remote<T> {
                         is_remote,
                         od,
                     ));
+                    // lobishell-android: upstream only speeds the timer up to MILLI1 for read_jobs
+                    // (see the two read_jobs.push sites below) — an upload-only session's timer
+                    // stayed at the default 30s tick, and since update_jobs_status() (below, in the
+                    // timer.tick() branch) was ALSO gated on read_jobs being non-empty, an
+                    // upload's job_progress was never reported at all. Matches the reported "upload
+                    // shows 0 bytes / no progress" bug exactly.
+                    self.timer = crate::rustdesk_interval(time::interval(MILLI1));
                     allow_err!(
                         peer.send(&fs::new_send(id, r#type, path, file_num, include_hidden))
                             .await
