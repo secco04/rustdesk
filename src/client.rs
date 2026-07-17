@@ -1450,6 +1450,39 @@ impl AudioHandler {
         // diagnostic branches below can freely reference other `self` fields (decode_error_count,
         // logged_first_decode) alongside `d`/`buffer` without a closure-capture borrow conflict.
         if let Some((d, buffer)) = self.audio_decoder.as_mut() {
+            // Diagnostics (plans/soft-frolicking-thimble.md, "Audio" round) found AudioFrame
+            // messages reaching this point in the thousands with disable_audio.v=false (i.e. not
+            // muted) yet NEITHER the success nor the error log below ever fired — impossible for
+            // an exhaustively-matched Result unless decode_float itself never returned at all.
+            // The likely cause: opus-rs (a from-scratch reimplementation, not battle-tested
+            // libopus) panicking on some input this dedicated audio thread receives — the very
+            // first frame observed was a suspicious 3 bytes, plausibly a DTX/comfort-noise
+            // minimal packet an edge case in a young decoder could mishandle. A panic in this
+            // std::thread doesn't crash the app, but DOES silently kill the thread forever after
+            // (this loop's `self.audio_sender.send(...).ok()` in io_loop.rs swallows the
+            // resulting channel error with no log) — matching "format negotiates fine, then
+            // total, permanent silence" exactly. `catch_unwind` here is the same defensive
+            // pattern already used at the JNI boundary (android-shim's `guard()`), applied at
+            // this second boundary so one bad packet degrades to "this frame dropped" instead of
+            // "audio is dead for the rest of the session".
+            #[cfg(target_os = "android")]
+            let decode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                d.decode_float(&frame.data, buffer, false)
+            }))
+            .unwrap_or_else(|panic_payload| {
+                let msg = panic_payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                log::error!(
+                    "Android audio decode_float PANICKED (input {} bytes): {}",
+                    frame.data.len(),
+                    msg
+                );
+                Err(crate::audio_codec_stub::OpusError::from("decode panicked — see log"))
+            });
+            #[cfg(not(target_os = "android"))]
             let decode_result = d.decode_float(&frame.data, buffer, false);
             #[cfg(target_os = "android")]
             if let Err(e) = &decode_result {

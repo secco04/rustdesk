@@ -23,6 +23,12 @@ impl fmt::Display for OpusError {
 
 impl std::error::Error for OpusError {}
 
+impl From<&str> for OpusError {
+    fn from(s: &str) -> Self {
+        OpusError(s.to_string())
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum Channels {
     Mono,
