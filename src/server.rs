@@ -370,11 +370,23 @@ impl Server {
         }
     }
 
-    pub fn add_camera_connection(&mut self, conn: ConnInner) {
+    // lobishell-android: `audio_enabled` — unlike add_connection's generic "subscribe to every
+    // registered service except noperms" loop, this only ever subscribes to the camera video
+    // service, so a view-camera connection could never receive audio no matter what the client
+    // did on its own side (setAudioMuted/disable_audio have nothing to un-mute — the connection
+    // was never handed the audio stream in the first place). Mirrors add_connection's own
+    // audio_enabled() gate (self.audio && !self.disable_audio) for the same permission/mute
+    // semantics, just applied to one extra named service instead of the whole services map.
+    pub fn add_camera_connection(&mut self, conn: ConnInner, audio_enabled: bool) {
         if camera::primary_camera_exists() {
             let primary_camera_name =
                 video_service::get_service_name(VideoSource::Camera, camera::PRIMARY_CAMERA_IDX);
             if let Some(s) = self.services.get(&primary_camera_name) {
+                s.on_subscribe(conn.clone());
+            }
+        }
+        if audio_enabled {
+            if let Some(s) = self.services.get(audio_service::NAME) {
                 s.on_subscribe(conn.clone());
             }
         }

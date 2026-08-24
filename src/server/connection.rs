@@ -1961,11 +1961,15 @@ impl Connection {
     }
 
     fn try_sub_camera_displays(&mut self) {
+        // lobishell-android: pass audio_enabled through so add_camera_connection can also
+        // subscribe this connection to the audio service — see its own doc for why view-camera
+        // connections got no audio at all before this (they were never subscribed, full stop).
+        let audio_enabled = self.audio_enabled();
         if let Some(s) = self.server.upgrade() {
             let mut s = s.write().unwrap();
 
             s.try_add_primary_camera_service();
-            s.add_camera_connection(self.inner.clone());
+            s.add_camera_connection(self.inner.clone(), audio_enabled);
         }
     }
 
