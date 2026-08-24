@@ -2262,6 +2262,29 @@ pub fn session_get_display_size(session_id: SessionID, display: usize) -> (i32, 
     (0, 0)
 }
 
+/// Multi-monitor origin (lobishell-android): sync, pollable (x, y) getter for a display's position
+/// within the peer's COMBINED virtual desktop — same "small additive getter next to
+/// session_get_display_size" pattern, for the same headless-session reason. Needed because mouse
+/// input ultimately lands via enigo's Windows backend (`mouse_move_to`), which expects absolute
+/// virtual-desktop coordinates (offset from `SM_XVIRTUALSCREEN`/`SM_YVIRTUALSCREEN`), not
+/// coordinates local to whichever display is currently selected — the Android client was sending
+/// local 0..width/0..height coordinates unmodified, which only happened to work for a display
+/// whose own origin is (0,0) (typically the primary). A secondary/non-primary display (e.g. one
+/// positioned to the right, or a portrait-rotated monitor) has a nonzero origin, and taps sent
+/// without adding it landed on whatever display actually occupies that (0,0)-relative position —
+/// reported as "mouse moves on the first monitor" while viewing a different one. `DisplayInfo`
+/// (message.proto) already carries `x`/`y` for exactly this; `session_get_display_size` simply
+/// never read them. Returns (0, 0) if not known yet (peer info not received) — same fallback the
+/// paired size getter uses, so a caller that hasn't gotten a real origin yet just adds nothing.
+pub fn session_get_display_origin(session_id: SessionID, display: usize) -> (i32, i32) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        if let Some(d) = session.peer_info.read().unwrap().displays.get(display) {
+            return (d.x, d.y);
+        }
+    }
+    (0, 0)
+}
+
 /// Multi-monitor (lobishell-android): sync, pollable count of displays the peer reported — same
 /// "small additive getter next to session_get_display_size" pattern, for the same headless-session
 /// reason (no event_stream to push the count through). Used by the Android client to decide
