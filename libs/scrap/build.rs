@@ -158,6 +158,33 @@ fn generate_bindings(
         b = b.clang_arg(format!("-I{}", dir.display()));
     }
 
+    // M1 (plans/soft-frolicking-thimble.md): pass the NDK's own --target/--sysroot explicitly
+    // instead of relying on BINDGEN_EXTRA_CLANG_ARGS — cross-compiling from a Windows host through
+    // cargo-ndk's wrapper process didn't reliably forward that env var to every bindgen invocation
+    // in this build (worked for some crates, not others, inconsistently across otherwise-identical
+    // runs). Explicit .clang_arg() calls here are deterministic regardless of env var propagation.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        if let Ok(ndk) = std::env::var("ANDROID_NDK_HOME") {
+            let ndk = ndk.replace('\\', "/");
+            let clang_ver = fs::read_dir(format!("{ndk}/toolchains/llvm/prebuilt/windows-x86_64/lib/clang"))
+                .ok()
+                .and_then(|mut d| d.next())
+                .and_then(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned());
+            let sysroot = format!("{ndk}/toolchains/llvm/prebuilt/windows-x86_64/sysroot");
+            b = b
+                .clang_arg("--target=aarch64-linux-android21")
+                .clang_arg(format!("--sysroot={sysroot}"))
+                .clang_arg(format!("-isystem{sysroot}/usr/include"))
+                .clang_arg(format!("-isystem{sysroot}/usr/include/aarch64-linux-android"));
+            if let Some(ver) = clang_ver {
+                b = b.clang_arg(format!(
+                    "-isystem{ndk}/toolchains/llvm/prebuilt/windows-x86_64/lib/clang/{ver}/include"
+                ));
+            }
+        }
+    }
+
     b.generate().unwrap().write_to_file(ffi_rs).unwrap();
     fs::copy(ffi_rs, exact_file).ok(); // ignore failure
 }
@@ -246,7 +273,9 @@ fn main() {
 
     find_package("libyuv");
     gen_vcpkg_package("libvpx", "vpx_ffi.h", "vpx_ffi.rs", "^[vV].*");
-    gen_vcpkg_package("aom", "aom_ffi.h", "aom_ffi.rs", "^(aom|AOM|OBU|AV1).*");
+    // M1 experiment (plans/soft-frolicking-thimble.md): aom's vcpkg build hits a separate
+    // CMake/NDK ASM-compiler wiring issue; mod aom is also commented out in common/mod.rs.
+    // gen_vcpkg_package("aom", "aom_ffi.h", "aom_ffi.rs", "^(aom|AOM|OBU|AV1).*");
     gen_vcpkg_package("libyuv", "yuv_ffi.h", "yuv_ffi.rs", ".*");
     // ffmpeg();
 

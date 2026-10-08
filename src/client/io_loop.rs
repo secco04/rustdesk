@@ -102,6 +102,9 @@ pub struct Remote<T: InvokeUiSession> {
     last_record_state: bool,
     sent_close_reason: bool,
     cursor_dedupe: CursorDedupe,
+    // Audio (plans/soft-frolicking-thimble.md): diagnostic counter, see the AudioFrame arm above.
+    #[cfg(target_os = "android")]
+    audio_frame_count: u64,
 }
 
 #[derive(Default)]
@@ -154,6 +157,8 @@ impl<T: InvokeUiSession> Remote<T> {
             last_record_state: false,
             sent_close_reason: false,
             cursor_dedupe: Default::default(),
+            #[cfg(target_os = "android")]
+            audio_frame_count: 0,
         }
     }
 
@@ -323,6 +328,12 @@ impl<T: InvokeUiSession> Remote<T> {
                                     self.handler.msgbox("error", "Connection Error", &err.to_string(), "");
                                     break;
                                 }
+                                self.update_jobs_status();
+                            } else if !self.write_jobs.is_empty() {
+                                // lobishell-android: see the write_jobs.push() comment above — an
+                                // upload-only tick has no read_jobs work to do, but write_jobs still
+                                // needs its periodic job_progress report, and the timer must stay
+                                // fast (not fall through to the 30s reset below) while one is active.
                                 self.update_jobs_status();
                             } else {
                                 self.timer = crate::rustdesk_interval(time::interval_at(Instant::now() + SEC30, SEC30));
@@ -824,6 +835,13 @@ impl<T: InvokeUiSession> Remote<T> {
                         is_remote,
                         od,
                     ));
+                    // lobishell-android: upstream only speeds the timer up to MILLI1 for read_jobs
+                    // (see the two read_jobs.push sites below) — an upload-only session's timer
+                    // stayed at the default 30s tick, and since update_jobs_status() (below, in the
+                    // timer.tick() branch) was ALSO gated on read_jobs being non-empty, an
+                    // upload's job_progress was never reported at all. Matches the reported "upload
+                    // shows 0 bytes / no progress" bug exactly.
+                    self.timer = crate::rustdesk_interval(time::interval(MILLI1));
                     allow_err!(
                         peer.send(&fs::new_send(id, r#type, path, file_num, include_hidden))
                             .await
@@ -1685,6 +1703,16 @@ impl<T: InvokeUiSession> Remote<T> {
                         let lc = self.handler.lc.read().unwrap();
                         !lc.disable_clipboard.v && !lc.view_only.v
                     };
+                    // lobishell-android diagnostic (Round 24): confirm whether the peer even sends
+                    // this message at all, and whether our own disable_clipboard/view_only defaults
+                    // are gating it before it ever reaches handle_msg_clipboard.
+                    #[cfg(target_os = "android")]
+                    log::info!(
+                        "lobishell: received Clipboard message, clipboard_allowed={}, format={:?}, len={}",
+                        clipboard_allowed,
+                        cb.format,
+                        cb.content.len()
+                    );
                     if clipboard_allowed {
                         #[cfg(all(
                             feature = "flutter",
@@ -1723,6 +1751,14 @@ impl<T: InvokeUiSession> Remote<T> {
                         let lc = self.handler.lc.read().unwrap();
                         !lc.disable_clipboard.v && !lc.view_only.v
                     };
+                    // lobishell-android diagnostic (Round 24): same reasoning as the single-Clipboard
+                    // arm above.
+                    #[cfg(target_os = "android")]
+                    log::info!(
+                        "lobishell: received MultiClipboards message, clipboard_allowed={}, count={}",
+                        clipboard_allowed,
+                        _mcb.clipboards.len()
+                    );
                     if clipboard_allowed {
                         #[cfg(all(
                             feature = "flutter",
@@ -2247,6 +2283,24 @@ impl<T: InvokeUiSession> Remote<T> {
                     self.handler.handle_test_delay(t, peer).await;
                 }
                 Some(message::Union::AudioFrame(frame)) => {
+                    // Audio (plans/soft-frolicking-thimble.md): diagnostics for the "format
+                    // arrives but no sound" investigation — logs whether AudioFrame messages
+                    // reach the client AT ALL (over the wire, upstream of decode) and whether
+                    // this client's own mute gate is dropping them, since neither was previously
+                    // visible in any log. Android-only, rate-limited (frames arrive continuously).
+                    #[cfg(target_os = "android")]
+                    {
+                        self.audio_frame_count += 1;
+                        let muted = self.handler.lc.read().unwrap().disable_audio.v;
+                        if self.audio_frame_count == 1 || self.audio_frame_count % 100 == 0 {
+                            log::warn!(
+                                "AudioFrame #{} received ({} bytes), disable_audio.v={}",
+                                self.audio_frame_count,
+                                frame.data.len(),
+                                muted
+                            );
+                        }
+                    }
                     if !self.handler.lc.read().unwrap().disable_audio.v {
                         self.audio_sender
                             .send(MediaData::AudioFrame(Box::new(frame)))

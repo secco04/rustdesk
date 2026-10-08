@@ -847,6 +847,21 @@ pub fn handle_msg_clipboard(mut cb: Clipboard) {
     if cb.compress {
         cb.content = bytes::Bytes::from(hbb_common::compress::decompress(&cb.content));
     }
+    // lobishell-android (bidirectional clipboard sync): also feed our own poll-based text buffer
+    // (scrap::android::ffi::set_remote_clipboard_text) — the call_clipboard_manager_update_clipboard
+    // call below is a no-op for us (no Java ClipboardManager object registered, see that function's
+    // doc), so without this the received clipboard content would silently go nowhere.
+    if cb.format.enum_value() == Ok(base::message_proto::ClipboardFormat::Text) {
+        match String::from_utf8(cb.content.to_vec()) {
+            Ok(text) => {
+                log::info!("lobishell: handle_msg_clipboard extracted {} chars of text", text.len());
+                scrap::android::ffi::set_remote_clipboard_text(text);
+            }
+            Err(e) => log::warn!("lobishell: handle_msg_clipboard content wasn't valid utf8: {}", e),
+        }
+    } else {
+        log::info!("lobishell: handle_msg_clipboard got non-text format {:?}, ignoring", cb.format);
+    }
     let multi_clips = MultiClipboards {
         clipboards: vec![cb],
         ..Default::default()
@@ -864,6 +879,23 @@ pub fn handle_msg_multi_clipboards(mut mcb: MultiClipboards) {
         if cb.compress {
             cb.content = bytes::Bytes::from(hbb_common::compress::decompress(&cb.content));
         }
+    }
+    // lobishell-android: same reasoning as handle_msg_clipboard's — feed the first plain-text clip
+    // into our own poll-based buffer, since the Java ClipboardManager path is unusable for us.
+    if let Some(text_cb) = mcb
+        .clipboards
+        .iter()
+        .find(|c| c.format.enum_value() == Ok(base::message_proto::ClipboardFormat::Text))
+    {
+        match String::from_utf8(text_cb.content.to_vec()) {
+            Ok(text) => {
+                log::info!("lobishell: handle_msg_multi_clipboards extracted {} chars of text", text.len());
+                scrap::android::ffi::set_remote_clipboard_text(text);
+            }
+            Err(e) => log::warn!("lobishell: handle_msg_multi_clipboards content wasn't valid utf8: {}", e),
+        }
+    } else {
+        log::info!("lobishell: handle_msg_multi_clipboards found no Text-format clip among {} entries", mcb.clipboards.len());
     }
     if let Ok(bytes) = mcb.write_to_bytes() {
         let _ = scrap::android::ffi::call_clipboard_manager_update_clipboard(&bytes);

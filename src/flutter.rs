@@ -650,10 +650,392 @@ impl FlutterHandler {
     }
 }
 
+// lobishell-android (host cursor shape): `set_cursor_data`/`set_cursor_id` below only ever
+// `push_event(...)`, which is a no-op for a headless session — `session_start_headless`
+// deliberately never sets `event_stream` (no Dart isolate to push to), so the peer's cursor
+// shapes were decoded and then dropped on the floor. These statics give our JNI shim a
+// poll-based way to observe them, exactly like `scrap::android::ffi`'s clipboard buffers
+// (`set_remote_clipboard_text`/`take_remote_clipboard_text`) do for clipboard text.
+//
+// GLOBAL rather than per-session (same tradeoff the clipboard buffers already make): the shim
+// only ever drives one active session at a time, and threading a SessionID through here would
+// mean plumbing it into `InvokeUiSession`, whose methods take `&self` on a handler that doesn't
+// know its own session id. `take_headless_cursor` therefore ignores which session asked.
+//
+// The cache is required, not an optimization: the peer sends a full `CursorData` shape ONCE per
+// distinct cursor and thereafter refers back to it by id via `CursorId`. Without keeping the
+// shapes, every `CursorId` would leave us with nothing to draw.
+struct HeadlessCursorShape {
+    width: i32,
+    height: i32,
+    hotx: i32,
+    hoty: i32,
+    /// Decompressed RGBA, 4 bytes/pixel, `width * height * 4` long.
+    colors: Vec<u8>,
+}
+
+struct HeadlessCursorState {
+    shapes: HashMap<u64, HeadlessCursorShape>,
+    /// Insertion order, used to evict the oldest shape once `MAX_HEADLESS_CURSOR_SHAPES` is hit
+    /// so a long session can't grow `shapes` without bound. Hosts cycle through a modest set of
+    /// cursors, so eviction should be rare in practice; if an evicted id is later referenced by a
+    /// `CursorId`, we report nothing rather than drawing garbage.
+    order: std::collections::VecDeque<u64>,
+    /// Id of the cursor the peer says is currently shown, if its shape is known.
+    current: Option<u64>,
+    /// Set whenever `current` changes (or its shape is redefined); cleared by
+    /// `take_headless_cursor`, giving the same clear-on-read semantics as `getFrame`'s rgba
+    /// buffer — the caller polls on its video loop and only rebuilds its Bitmap on a change.
+    dirty: bool,
+}
+
+const MAX_HEADLESS_CURSOR_SHAPES: usize = 32;
+
+lazy_static::lazy_static! {
+    static ref HEADLESS_CURSOR: std::sync::Mutex<HeadlessCursorState> =
+        std::sync::Mutex::new(HeadlessCursorState {
+            shapes: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            current: None,
+            dirty: false,
+        });
+}
+
+/// lobishell-android: caches a decompressed cursor shape by id and marks it current. Called from
+/// `set_cursor_data` (see `HeadlessCursorShape`'s doc above for why).
+fn cache_headless_cursor(cd: &CursorData, colors: Vec<u8>) {
+    let mut state = HEADLESS_CURSOR.lock().unwrap();
+    let is_new = state
+        .shapes
+        .insert(
+            cd.id,
+            HeadlessCursorShape {
+                width: cd.width,
+                height: cd.height,
+                hotx: cd.hotx,
+                hoty: cd.hoty,
+                colors,
+            },
+        )
+        .is_none();
+    if is_new {
+        state.order.push_back(cd.id);
+        while state.order.len() > MAX_HEADLESS_CURSOR_SHAPES {
+            match state.order.pop_front() {
+                // Never evict the shape we're currently showing.
+                Some(old) if Some(old) == state.current => {
+                    state.order.push_back(old);
+                    break;
+                }
+                Some(old) => {
+                    state.shapes.remove(&old);
+                }
+                None => break,
+            }
+        }
+    }
+    state.current = Some(cd.id);
+    state.dirty = true;
+}
+
+/// lobishell-android: marks an already-cached shape current. Called from `set_cursor_id`. An id
+/// we've never seen a `CursorData` for (or whose shape was evicted) leaves `current` untouched
+/// rather than blanking the cursor.
+fn select_headless_cursor(id: u64) {
+    let mut state = HEADLESS_CURSOR.lock().unwrap();
+    if !state.shapes.contains_key(&id) {
+        return;
+    }
+    if state.current != Some(id) {
+        state.current = Some(id);
+        state.dirty = true;
+    }
+}
+
+/// lobishell-android: takes the current cursor if it changed since the last call, packed for the
+/// JNI shim as 4 little-endian i32s (`width`, `height`, `hotx`, `hoty`) followed by
+/// `width * height * 4` bytes of RGBA pixel data. Returns None when unchanged (or when nothing is
+/// known yet), i.e. clear-on-read polling — same contract as `take_remote_clipboard_text`.
+pub fn take_headless_cursor() -> Option<Vec<u8>> {
+    let mut state = HEADLESS_CURSOR.lock().unwrap();
+    if !state.dirty {
+        return None;
+    }
+    let id = state.current?;
+    let out = {
+        let shape = state.shapes.get(&id)?;
+        let mut out = Vec::with_capacity(16 + shape.colors.len());
+        out.extend_from_slice(&shape.width.to_le_bytes());
+        out.extend_from_slice(&shape.height.to_le_bytes());
+        out.extend_from_slice(&shape.hotx.to_le_bytes());
+        out.extend_from_slice(&shape.hoty.to_le_bytes());
+        out.extend_from_slice(&shape.colors);
+        out
+    };
+    state.dirty = false;
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------------------------
+// lobishell-android (audio playback, plans/soft-frolicking-thimble.md "Audio" round):
+// `AudioHandler::handle_frame` (client.rs) decodes each incoming `AudioFrame` into f32 PCM on ITS
+// OWN dedicated thread (`client::start_audio_thread`) — a thread the headless setup gets for
+// free, since nothing in that code path goes through `InvokeUiSession`/`push_event` at all (unlike
+// video/cursor/clipboard, which needed the poll-cache workaround specifically because their
+// natural path IS push_event). What's still missing headless is a way to get the decoded PCM (and
+// the negotiated sample rate/channel count, which can change mid-session) OUT to the JNI shim —
+// this cache provides that. Global rather than per-session, same tradeoff as the cursor/clipboard
+// caches: only one active control session drives audio at a time in this app.
+// ---------------------------------------------------------------------------------------------
+struct HeadlessAudioState {
+    /// Set whenever the negotiated format changes; cleared by `take_headless_audio_format`.
+    format: Option<(u32, u16)>,
+    /// Flat interleaved PCM sample queue — matches magnum_opus/opus-rs's own decode_float output
+    /// shape directly, no repacking needed on the push side.
+    pcm: std::collections::VecDeque<f32>,
+}
+
+// ~2s of 48kHz stereo audio: generous headroom for a Kotlin poll thread that's briefly stalled
+// (e.g. a GC pause), small enough that a genuinely stuck consumer can't grow this unbounded.
+const MAX_HEADLESS_AUDIO_SAMPLES: usize = 48_000 * 2 * 2;
+
+lazy_static::lazy_static! {
+    static ref HEADLESS_AUDIO: std::sync::Mutex<HeadlessAudioState> =
+        std::sync::Mutex::new(HeadlessAudioState { format: None, pcm: std::collections::VecDeque::new() });
+}
+
+/// lobishell-android: called from `AudioHandler::handle_format` (client.rs, Android branch) when
+/// the peer's audio format is (re)negotiated.
+pub fn push_headless_audio_format(sample_rate: u32, channels: u16) {
+    HEADLESS_AUDIO.lock().unwrap().format = Some((sample_rate, channels));
+}
+
+/// lobishell-android: called from `AudioHandler::handle_frame` (client.rs, Android branch) with
+/// each frame's decoded PCM. Drops the OLDEST samples on overflow rather than the newest — smooth
+/// continuous playback needs continuity more than completeness, the same tradeoff any live audio
+/// ring buffer makes under backpressure.
+pub fn push_headless_audio_pcm(samples: &[f32]) {
+    let mut state = HEADLESS_AUDIO.lock().unwrap();
+    state.pcm.extend(samples.iter().copied());
+    while state.pcm.len() > MAX_HEADLESS_AUDIO_SAMPLES {
+        state.pcm.pop_front();
+    }
+}
+
+/// lobishell-android: clear-on-change poll for the negotiated format — returns `(sample_rate,
+/// channels)` once right after it's (re)set, then `None` until it changes again. The JNI shim
+/// (re)builds its `AudioTrack` whenever this returns non-null.
+pub fn take_headless_audio_format() -> Option<(u32, u16)> {
+    HEADLESS_AUDIO.lock().unwrap().format.take()
+}
+
+/// lobishell-android: drains up to `max_samples` interleaved PCM samples (FIFO order), or an
+/// empty Vec if none are pending yet.
+pub fn take_headless_audio_pcm(max_samples: usize) -> Vec<f32> {
+    let mut state = HEADLESS_AUDIO.lock().unwrap();
+    let n = max_samples.min(state.pcm.len());
+    state.pcm.drain(0..n).collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// lobishell-android (auto quality / connection stats): `update_quality_status` already fires
+// periodically with everything an adaptive-quality heuristic or a latency/bandwidth readout
+// needs — `delay`/`target_bitrate` from the server's own TestDelay ping-pong (roughly every few
+// seconds, see ui_session_interface.rs's handle_test_delay), `speed`/`fps`/`codec_format`/`chroma`
+// from a separate ~1s stats tick (client/io_loop.rs). Nothing new needs to be requested from the
+// peer — this cache just gets the data OUT of the no-op push_event path, same as cursor/clipboard/
+// audio before it. LATEST-VALUE overwrite (not a queue — only the current status matters), with
+// per-field MERGE rather than wholesale replacement: the two update sites above each only ever
+// populate a subset of QualityStatus's fields (`..Default::default()` for the rest), so a
+// `delay`-only update must not blank out the `speed`/`fps` fields the OTHER call site set most
+// recently, and vice versa.
+#[derive(Default, Clone)]
+struct HeadlessQualityStatus {
+    speed: Option<String>,
+    fps: Option<i32>,
+    delay: Option<i32>,
+    target_bitrate: Option<i32>,
+    codec_format: Option<String>,
+}
+
+lazy_static::lazy_static! {
+    static ref HEADLESS_QUALITY: std::sync::Mutex<HeadlessQualityStatus> =
+        std::sync::Mutex::new(HeadlessQualityStatus::default());
+}
+
+fn push_headless_quality_status(status: &QualityStatus) {
+    let mut state = HEADLESS_QUALITY.lock().unwrap();
+    if status.speed.is_some() {
+        state.speed = status.speed.clone();
+    }
+    // Only one display in this headless client (see session_get_display_size's own single-display
+    // framing) — take whichever fps value is present rather than exposing the whole per-display map.
+    if let Some(fps) = status.fps.values().next() {
+        state.fps = Some(*fps);
+    }
+    if status.delay.is_some() {
+        state.delay = status.delay;
+    }
+    if status.target_bitrate.is_some() {
+        state.target_bitrate = status.target_bitrate;
+    }
+    if status.codec_format.is_some() {
+        state.codec_format = status.codec_format.map(|f| f.to_string());
+    }
+}
+
+/// lobishell-android: the latest known connection stats as a JSON object, or `"{}"` if nothing has
+/// arrived yet. Any field not yet known is simply omitted (not written as `null`), so the caller
+/// can treat a missing key exactly like "unknown" without a separate null-check. Layout:
+/// `{"speed":"1.2MB/s","fps":30,"delay":45,"target_bitrate":2000,"codec_format":"VP9"}`.
+pub fn take_headless_quality_status() -> String {
+    let state = HEADLESS_QUALITY.lock().unwrap().clone();
+    let mut obj = serde_json::Map::new();
+    if let Some(speed) = state.speed {
+        obj.insert("speed".to_string(), serde_json::Value::String(speed));
+    }
+    if let Some(fps) = state.fps {
+        obj.insert("fps".to_string(), serde_json::Value::from(fps));
+    }
+    if let Some(delay) = state.delay {
+        obj.insert("delay".to_string(), serde_json::Value::from(delay));
+    }
+    if let Some(target_bitrate) = state.target_bitrate {
+        obj.insert("target_bitrate".to_string(), serde_json::Value::from(target_bitrate));
+    }
+    if let Some(codec_format) = state.codec_format {
+        obj.insert("codec_format".to_string(), serde_json::Value::String(codec_format));
+    }
+    serde_json::Value::Object(obj).to_string()
+}
+
+// lobishell-android (file transfer): the file-transfer InvokeUiSession callbacks below
+// (`update_folder_files`, `job_progress`, `job_done`, `job_error`, `override_file_confirm`) only
+// ever `push_event(...)`, which is a no-op for a headless session (`session_start_headless` never
+// sets `event_stream`). These queues give our JNI shim a poll-based way to drain those events as
+// JSON strings — same idea as the cursor/clipboard poll caches, but keyed per `SessionID` because
+// a user can plausibly run several independent file-transfer sessions (to different peers) at
+// once, and the file-transfer session is a SEPARATE session from the control/video one anyway.
+//
+// The FlutterHandler methods don't receive a `SessionID`, but a headless file-transfer session's
+// handler has exactly one entry in `session_handlers` (its own ui session), so we recover it via
+// `headless_session_id()` below.
+#[derive(Default)]
+struct HeadlessFtQueues {
+    /// FIFO of directory-listing results, each a JSON string (see `ft_push_dir_listing`).
+    dir_listings: std::collections::VecDeque<String>,
+    /// FIFO of job status events (progress / done / error), each a JSON string.
+    job_events: std::collections::VecDeque<String>,
+    /// Single pending overwrite/resume prompt (clear-on-read). The job blocks until it's answered
+    /// via `session_set_confirm_override_file`, so at most one is outstanding at a time.
+    override_confirm: Option<String>,
+}
+
+// Bounds so a session whose consumer stops polling can't grow these without limit. Directory
+// listings and job events are both low-rate; these caps are generous and only drop the oldest.
+const MAX_FT_DIR_LISTINGS: usize = 64;
+const MAX_FT_JOB_EVENTS: usize = 512;
+
+lazy_static::lazy_static! {
+    static ref HEADLESS_FT: std::sync::Mutex<HashMap<SessionID, HeadlessFtQueues>> =
+        std::sync::Mutex::new(HashMap::new());
+}
+
+fn ft_push_dir_listing(session_id: SessionID, json: String) {
+    let mut map = HEADLESS_FT.lock().unwrap();
+    let q = map.entry(session_id).or_default();
+    q.dir_listings.push_back(json);
+    while q.dir_listings.len() > MAX_FT_DIR_LISTINGS {
+        q.dir_listings.pop_front();
+    }
+}
+
+fn ft_push_job_event(session_id: SessionID, json: String) {
+    let mut map = HEADLESS_FT.lock().unwrap();
+    let q = map.entry(session_id).or_default();
+    q.job_events.push_back(json);
+    while q.job_events.len() > MAX_FT_JOB_EVENTS {
+        q.job_events.pop_front();
+    }
+}
+
+fn ft_set_override_confirm(session_id: SessionID, json: String) {
+    let mut map = HEADLESS_FT.lock().unwrap();
+    map.entry(session_id).or_default().override_confirm = Some(json);
+}
+
+/// lobishell-android: drain the oldest pending directory-listing JSON for `session_id`, or None if
+/// the queue is empty (FIFO clear-on-read, one entry per call).
+pub fn ft_take_dir_listing(session_id: &SessionID) -> Option<String> {
+    HEADLESS_FT
+        .lock()
+        .unwrap()
+        .get_mut(session_id)?
+        .dir_listings
+        .pop_front()
+}
+
+/// lobishell-android: drain the oldest pending job-status JSON for `session_id`, or None if empty.
+pub fn ft_take_job_event(session_id: &SessionID) -> Option<String> {
+    HEADLESS_FT
+        .lock()
+        .unwrap()
+        .get_mut(session_id)?
+        .job_events
+        .pop_front()
+}
+
+/// lobishell-android: take the pending overwrite-confirm prompt for `session_id` (clear-on-read),
+/// or None if none is pending.
+pub fn ft_take_override_confirm(session_id: &SessionID) -> Option<String> {
+    HEADLESS_FT
+        .lock()
+        .unwrap()
+        .get_mut(session_id)?
+        .override_confirm
+        .take()
+}
+
+fn ft_entries_to_json(entries: &Vec<FileEntry>) -> Vec<serde_json::Value> {
+    entries
+        .iter()
+        .map(|e| {
+            json!({
+                // FileType enum int value: 0=Dir, 2=DirLink, 3=DirDrive, 4=File, 5=FileLink.
+                "entry_type": e.entry_type.value(),
+                "name": e.name,
+                "is_hidden": e.is_hidden,
+                "size": e.size,
+                "modified_time": e.modified_time,
+            })
+        })
+        .collect()
+}
+
+impl FlutterHandler {
+    /// lobishell-android: the SessionID of this (headless) handler's single ui session. A
+    /// headless file-transfer session has exactly one entry in `session_handlers`, so returning
+    /// the first key identifies it. Returns None only if called before the handler is registered.
+    fn headless_session_id(&self) -> Option<SessionID> {
+        self.session_handlers.read().unwrap().keys().next().copied()
+    }
+}
+
 impl InvokeUiSession for FlutterHandler {
     // On the event stream, so that it keeps its order with the cursor_id events around it.
     fn set_cursor_data(&self, cd: CursorData) {
-        let colors = cd.colors.to_vec();
+        // 1.5.0: cd.colors arrives already decompressed (io_loop.rs decodes it before this call).
+        let mut colors = cd.colors.to_vec();
+        // lobishell-android: same workaround src/ui/remote.rs's SciterHandler::set_cursor_data
+        // applies ("somehow all 0 images shows black rect") — an all-zero (fully transparent)
+        // buffer renders as an opaque black rectangle, so nudge one alpha byte.
+        if colors.len() > 3 && colors.iter().all(|x| *x == 0) {
+            log::info!("Fix transparent");
+            colors[3] = 1;
+        }
+        // lobishell-android: cache the shape for our poll-based JNI getter. A headless session has
+        // no event_stream, so the loop below is a no-op for it and stays intact for normal use.
+        cache_headless_cursor(&cd, colors.clone());
         for session in self.session_handlers.read().unwrap().values() {
             if let Some(stream) = &session.event_stream {
                 stream.add(EventToUI::Cursor {
@@ -669,6 +1051,11 @@ impl InvokeUiSession for FlutterHandler {
     }
 
     fn set_cursor_id(&self, id: String) {
+        // lobishell-android: the peer refers back to an already-sent shape by id — select it in
+        // our cache so the headless getter reports the right cursor (see cache_headless_cursor).
+        if let Ok(id) = id.parse::<u64>() {
+            select_headless_cursor(id);
+        }
         self.push_event("cursor_id", &[("id", &id.to_string())], &[]);
     }
 
@@ -695,6 +1082,13 @@ impl InvokeUiSession for FlutterHandler {
     fn close_success(&self) {}
 
     fn update_quality_status(&self, status: QualityStatus) {
+        // lobishell-android (auto quality / connection stats): also cache the latest status for
+        // the headless poll consumer before the (no-op) push_event below — see
+        // `push_headless_quality_status`'s doc. RustDesk already sends everything an auto-quality
+        // heuristic needs for free: `delay`/`target_bitrate` arrive periodically via the server's
+        // own TestDelay ping-pong (see ui_session_interface.rs's handle_test_delay), `speed`/`fps`
+        // via a separate ~1s stats tick (client/io_loop.rs) — nothing new to request from the peer.
+        push_headless_quality_status(&status);
         const NULL: String = String::new();
         self.push_event(
             "update_quality_status",
@@ -736,6 +1130,19 @@ impl InvokeUiSession for FlutterHandler {
     }
 
     fn job_error(&self, id: i32, err: String, file_num: i32) {
+        // lobishell-android: also queue for the headless poll cache before the (no-op) push_event.
+        if let Some(session_id) = self.headless_session_id() {
+            ft_push_job_event(
+                session_id,
+                json!({
+                    "type": "error",
+                    "id": id,
+                    "file_num": file_num,
+                    "err": err,
+                })
+                .to_string(),
+            );
+        }
         self.push_event(
             "job_error",
             &[
@@ -748,6 +1155,18 @@ impl InvokeUiSession for FlutterHandler {
     }
 
     fn job_done(&self, id: i32, file_num: i32) {
+        // lobishell-android: also queue for the headless poll cache before the (no-op) push_event.
+        if let Some(session_id) = self.headless_session_id() {
+            ft_push_job_event(
+                session_id,
+                json!({
+                    "type": "done",
+                    "id": id,
+                    "file_num": file_num,
+                })
+                .to_string(),
+            );
+        }
         self.push_event(
             "job_done",
             &[("id", &id.to_string()), ("file_num", &file_num.to_string())],
@@ -770,6 +1189,22 @@ impl InvokeUiSession for FlutterHandler {
         #[allow(unused_variables)] is_local: bool,
         only_count: bool,
     ) {
+        // lobishell-android: also queue the listing for the headless poll cache before the (no-op)
+        // push_event below. Covers both a real remote listing (`is_local == false`) and the
+        // local-preview count that a read job emits (`is_local == true`, `only_count == true`).
+        if let Some(session_id) = self.headless_session_id() {
+            ft_push_dir_listing(
+                session_id,
+                json!({
+                    "id": id,
+                    "path": path,
+                    "is_local": is_local,
+                    "only_count": only_count,
+                    "entries": ft_entries_to_json(entries),
+                })
+                .to_string(),
+            );
+        }
         // TODO opt
         if only_count {
             self.push_event(
@@ -817,6 +1252,22 @@ impl InvokeUiSession for FlutterHandler {
         is_upload: bool,
         is_identical: bool,
     ) {
+        // lobishell-android: stash the prompt for the headless poll cache (clear-on-read) before
+        // the (no-op) push_event. The job blocks until answered via
+        // `session_set_confirm_override_file`, so a single pending slot is correct.
+        if let Some(session_id) = self.headless_session_id() {
+            ft_set_override_confirm(
+                session_id,
+                json!({
+                    "id": id,
+                    "file_num": file_num,
+                    "to": to,
+                    "is_upload": is_upload,
+                    "is_identical": is_identical,
+                })
+                .to_string(),
+            );
+        }
         self.push_event(
             "override_file_confirm",
             &[
@@ -831,6 +1282,20 @@ impl InvokeUiSession for FlutterHandler {
     }
 
     fn job_progress(&self, id: i32, file_num: i32, speed: f64, finished_size: f64) {
+        // lobishell-android: also queue for the headless poll cache before the (no-op) push_event.
+        if let Some(session_id) = self.headless_session_id() {
+            ft_push_job_event(
+                session_id,
+                json!({
+                    "type": "progress",
+                    "id": id,
+                    "file_num": file_num,
+                    "speed": speed,
+                    "finished_size": finished_size,
+                })
+                .to_string(),
+            );
+        }
         self.push_event(
             "job_progress",
             &[
@@ -1219,7 +1684,23 @@ impl FlutterHandler {
         //
         // 1. "display 1" will not send the event.
         // 2. "displays 0&1" will not send the event. Because it uses texutre render for now.
-        if !is_sent {
+        //
+        // M3 (plans/soft-frolicking-thimble.md): this `!is_sent` branch assumed the ONLY way a
+        // frame ever gets consumed is via a pushed `EventToUI::Rgba` event reaching a live
+        // `event_stream` — so if nothing was notified, it eagerly discards the frame (valid=false)
+        // rather than leave a stale one sitting around forever. `session_start_headless` (see its
+        // own doc) intentionally NEVER sets `event_stream` (no Dart isolate to push to) — so
+        // `is_sent` is unconditionally false for every single frame, and this reset the buffer
+        // back to invalid within the SAME synchronous call that had just marked it valid a few
+        // lines above. Our own polling consumer (`session_get_rgba`/`session_next_rgba`, called
+        // from a separate JNI-side thread) therefore almost never observed `valid == true` — it
+        // would have to race into the handful of nanoseconds between the two writes. Confirmed
+        // on-device: frames were decoding (fps counter updating) but essentially never drawn.
+        // Fix: only discard the frame here if NO session handler exists at all (a truly orphaned
+        // frame nobody could ever consume) — if one exists (headless or not), leave `valid` as the
+        // decoder set it, so a polling consumer without an event stream still gets to read it and
+        // is responsible for invalidating it itself via `session_next_rgba` once actually consumed.
+        if !is_sent && self.session_handlers.read().unwrap().is_empty() {
             if let Some(rgba_data) = self.display_rgbas.write().unwrap().get_mut(&display) {
                 rgba_data.valid = false;
             }
@@ -1389,6 +1870,53 @@ pub fn session_start_(
         if !is_connected && is_first_ui_session {
             log::info!(
                 "Session {} start, use texture render: {}",
+                id,
+                session.use_texture_render.load(Ordering::Relaxed)
+            );
+            let session = (*session).clone();
+            std::thread::spawn(move || {
+                let round = session.connection_round_state.lock().unwrap().new_round();
+                io_loop(session, round);
+            });
+        }
+        Ok(())
+    } else {
+        bail!("No session with peer id {}", id)
+    }
+}
+
+/// M2 (plans/soft-frolicking-thimble.md): small additive function for the android-shim JNI
+/// plugin, which has no Dart isolate and therefore cannot construct a real `StreamSink<EventToUI>`
+/// (it wraps a Dart `MessagePort` obtained from `Dart_NewNativePort_DL`, which requires an actual
+/// running Dart VM to have called `Dart_InitializeApiDL` — there is none here). This mirrors
+/// `session_start_` exactly except it never touches `h.event_stream` (left as whatever
+/// `session_add` already set it to, i.e. `None`) — `io_loop` and everything else already treat a
+/// `None` event_stream as "nothing to push UI events to" and skip sending, so leaving it unset is
+/// safe. Event delivery for a JNI-only caller is done by polling sync functions instead (e.g.
+/// `session_get_rgba`/`session_next_rgba` for video, once M3 gets there).
+pub fn session_start_headless(session_id: &SessionID, id: &str) -> ResultType<()> {
+    let mut is_connected = false;
+    let mut is_found = false;
+    for s in sessions::get_sessions() {
+        if let Some(h) = s.session_handlers.write().unwrap().get_mut(session_id) {
+            is_connected = h.event_stream.is_some();
+            is_found = true;
+            break;
+        }
+    }
+    if !is_found {
+        bail!(
+            "No session with peer id {}, session id: {}",
+            id,
+            session_id.to_string()
+        );
+    }
+
+    if let Some(session) = sessions::get_session_by_session_id(session_id) {
+        let is_first_ui_session = session.session_handlers.read().unwrap().len() == 1;
+        if !is_connected && is_first_ui_session {
+            log::info!(
+                "Session {} start (headless), use texture render: {}",
                 id,
                 session.use_texture_render.load(Ordering::Relaxed)
             );
@@ -1696,6 +2224,162 @@ pub fn session_get_rgba_size(session_id: SessionID, display: usize) -> usize {
             .map_or(0, |rgba| rgba.data.len());
     }
     0
+}
+
+/// M3 (plans/soft-frolicking-thimble.md): synchronous, pollable (width, height) getter for a
+/// headless session's display, added for the same reason as `session_start_headless` — the normal
+/// channel for this (`make_displays_msg`, built from `PeerInfo::displays` and pushed through the
+/// event stream in `set_peer_info`/`set_displays`) is unavailable since `session_start_headless`
+/// never sets `event_stream`. `set_peer_info`/`set_displays` populate `PeerInfo.displays`
+/// unconditionally (the event push is just an extra side effect on top), so the same data can be
+/// read directly here. Returns (0, 0) if the session or that display index isn't known yet (e.g.
+/// called before the peer handshake/first frame).
+pub fn session_get_display_size(session_id: SessionID, display: usize) -> (i32, i32) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        if let Some(d) = session.peer_info.read().unwrap().displays.get(display) {
+            return (d.width, d.height);
+        }
+    }
+    (0, 0)
+}
+
+/// Multi-monitor origin (lobishell-android): sync, pollable (x, y) getter for a display's position
+/// within the peer's COMBINED virtual desktop — same "small additive getter next to
+/// session_get_display_size" pattern, for the same headless-session reason. Needed because mouse
+/// input ultimately lands via enigo's Windows backend (`mouse_move_to`), which expects absolute
+/// virtual-desktop coordinates (offset from `SM_XVIRTUALSCREEN`/`SM_YVIRTUALSCREEN`), not
+/// coordinates local to whichever display is currently selected — the Android client was sending
+/// local 0..width/0..height coordinates unmodified, which only happened to work for a display
+/// whose own origin is (0,0) (typically the primary). A secondary/non-primary display (e.g. one
+/// positioned to the right, or a portrait-rotated monitor) has a nonzero origin, and taps sent
+/// without adding it landed on whatever display actually occupies that (0,0)-relative position —
+/// reported as "mouse moves on the first monitor" while viewing a different one. `DisplayInfo`
+/// (message.proto) already carries `x`/`y` for exactly this; `session_get_display_size` simply
+/// never read them. Returns (0, 0) if not known yet (peer info not received) — same fallback the
+/// paired size getter uses, so a caller that hasn't gotten a real origin yet just adds nothing.
+pub fn session_get_display_origin(session_id: SessionID, display: usize) -> (i32, i32) {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        if let Some(d) = session.peer_info.read().unwrap().displays.get(display) {
+            return (d.x, d.y);
+        }
+    }
+    (0, 0)
+}
+
+/// Multi-monitor (lobishell-android): sync, pollable count of displays the peer reported — same
+/// "small additive getter next to session_get_display_size" pattern, for the same headless-session
+/// reason (no event_stream to push the count through). Used by the Android client to decide
+/// whether to show a display picker at all, and to bound the index passed to
+/// flutter_ffi::session_switch_display. Returns 0 if not known yet.
+pub fn session_get_display_count(session_id: SessionID) -> i32 {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        return session.peer_info.read().unwrap().displays.len() as i32;
+    }
+    0
+}
+
+/// Privacy mode (plans/soft-frolicking-thimble.md): whether the connected peer advertised support
+/// for it at all (`PeerInfo.features.privacy_mode`, the same field RustDesk's own Flutter UI reads
+/// via `set_peer_info`'s push_event — `set_peer_info` already unconditionally caches the peer's
+/// whole PeerInfo into `session.peer_info` regardless of push_event succeeding, same as
+/// `session_get_display_size` above reads `.displays` from the same cache). No new patch needed —
+/// `session_toggle_privacy_mode` (below) and the toggle-state getter already exist upstream in
+/// `flutter_ffi.rs`/`client.rs`; this is the one missing piece, "does the peer even support it."
+pub fn session_is_privacy_mode_supported(session_id: SessionID) -> bool {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        return session
+            .peer_info
+            .read()
+            .unwrap()
+            .features
+            .iter()
+            .next()
+            .map(|f| f.privacy_mode)
+            .unwrap_or(false);
+    }
+    false
+}
+
+/// The first privacy-mode implementation key the peer advertised supporting (from
+/// `PeerInfo.platform_additions`'s own `"supported_privacy_mode_impl": [[impl_key, tip_key], ...]`
+/// list — confirmed via a real on-device PeerInfo dump this session, not guessed), or an empty
+/// string if none/not yet known. `toggle_privacy_mode` needs a specific impl_key — RustDesk's own
+/// Flutter UI lets the user pick among several when more than one is offered; this headless client
+/// just uses whichever the peer lists first, a reasonable default absent any UI to choose
+/// otherwise.
+pub fn session_default_privacy_mode_impl(session_id: SessionID) -> String {
+    let Some(session) = sessions::get_session_by_session_id(&session_id) else {
+        return String::new();
+    };
+    let platform_additions = session.peer_info.read().unwrap().platform_additions.clone();
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&platform_additions) else {
+        return String::new();
+    };
+    parsed
+        .get("supported_privacy_mode_impl")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|entry| entry.as_array())
+        .and_then(|pair| pair.first())
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// View Camera (plans/soft-frolicking-thimble.md): whether the connected peer advertised a camera
+/// to view, via `PeerInfo.platform_additions`'s own `"support_view_camera": true/false` flag (same
+/// cache as `session_default_privacy_mode_impl` above reads its own key from — `set_peer_info`
+/// unconditionally populates `session.peer_info` for every headless session regardless of
+/// push_event). Meant to be read on the already-open CONTROL session (not a dedicated view-camera
+/// session, which won't have peer_info populated until it's connected) to decide whether to show a
+/// "View Camera" entry point at all before opening the second, dedicated session.
+pub fn session_is_view_camera_supported(session_id: SessionID) -> bool {
+    let Some(session) = sessions::get_session_by_session_id(&session_id) else {
+        return false;
+    };
+    let platform_additions = session.peer_info.read().unwrap().platform_additions.clone();
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&platform_additions) else {
+        return false;
+    };
+    parsed
+        .get("support_view_camera")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Pre-connect online check (lobishell-android): queries the rendezvous server directly for
+/// whether `id` is currently online, without needing a session at all. RustDesk's own public
+/// `client::peer_online::query_online_states` wrapper delivers its result through
+/// `start_flutter_async_runner` + a global Flutter event stream — plumbing our headless client
+/// never sets up (same reason `session_start_headless` exists). This instead blocks on the
+/// lower-level `query_online_states_` primitive directly (now `pub(crate)`, see its doc), which
+/// already returns the (onlines, offlines) pair with no callback needed. Uses whatever
+/// custom-server config was last set via `main_set_option` (same as a real connect). Blocks the
+/// calling thread for up to ~3s (the query's own internal timeout) — call off the UI thread.
+/// Returns 1 = online, 0 = offline, -1 = unknown (query itself failed, e.g. no network reachable
+/// to the rendezvous server) — callers should treat -1 as "don't block the normal connect flow",
+/// not as a definite offline.
+pub fn session_is_id_online(id: String) -> i32 {
+    let rt = match hbb_common::tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(_) => return -1,
+    };
+    let ids = vec![id.clone()];
+    match rt.block_on(crate::client::peer_online::query_online_states_(
+        &ids,
+        std::time::Duration::from_millis(3_000),
+    )) {
+        Ok((onlines, offlines)) => {
+            if onlines.contains(&id) {
+                1
+            } else if offlines.contains(&id) {
+                0
+            } else {
+                -1
+            }
+        }
+        Err(_) => -1,
+    }
 }
 
 #[no_mangle]

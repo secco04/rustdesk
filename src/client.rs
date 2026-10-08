@@ -2,14 +2,14 @@
 use crate::clipboard::clipboard_listener::{self, ClipboardEvent};
 use async_trait::async_trait;
 use bytes::Bytes;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, Host, StreamConfig,
 };
 use crossbeam_queue::ArrayQueue;
-use magnum_opus::{Channels::*, Decoder as AudioDecoder};
-#[cfg(not(target_os = "linux"))]
+use crate::audio_codec_stub::{Channels::*, Decoder as AudioDecoder};
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 use ringbuf::{ring_buffer::RbBase, Rb};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -92,11 +92,11 @@ use crate::ui_session_interface::SessionPermissionConfig;
 
 pub use super::lang::*;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 mod audio_playback;
 #[cfg(target_os = "windows")]
 mod audio_playback_recovery;
-#[cfg(all(test, not(target_os = "linux")))]
+#[cfg(all(test, not(any(target_os = "linux", target_os = "android"))))]
 #[path = "client/tests/audio_state_tests.rs"]
 mod audio_state_tests;
 pub mod file_trait;
@@ -129,7 +129,7 @@ pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str =
 pub const SCRAP_X11_REQUIRED: &str = "x11 expected";
 pub const SCRAP_X11_REF_URL: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub const AUDIO_BUFFER_MS: usize = 3000;
 
 #[cfg(feature = "flutter")]
@@ -157,7 +157,7 @@ struct ClipboardState {
     running: bool,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 lazy_static::lazy_static! {
     static ref AUDIO_HOST: Host = cpal::default_host();
 }
@@ -2129,23 +2129,30 @@ pub struct AudioHandler {
     audio_decoder: Option<(AudioDecoder, Vec<f32>)>,
     #[cfg(target_os = "linux")]
     simple: Option<psimple::Simple>,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     audio_buffer: AudioBuffer,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     audio_resampler: Option<crate::audio_resampler::AudioResampler>,
     sample_rate: (u32, u32),
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     audio_stream: Option<Box<dyn StreamTrait>>,
     channels: u16,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     device_channel: u16,
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     playback_status: Arc<audio_playback::AudioPlaybackStatus>,
     #[cfg(target_os = "windows")]
     playback_recovery: audio_playback_recovery::PlaybackRecovery,
+    // Audio (plans/soft-frolicking-thimble.md): diagnostics for the Android decode path — logged
+    // once (success) / rate-limited (errors) rather than per-frame, since frames arrive every
+    // ~20-60ms and per-frame logging would flood logcat instantly.
+    #[cfg(target_os = "android")]
+    logged_first_decode: bool,
+    #[cfg(target_os = "android")]
+    decode_error_count: u32,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 #[derive(Clone, Copy)]
 struct DecodedAudioConfig {
     sample_rate: u32,
@@ -2153,7 +2160,7 @@ struct DecodedAudioConfig {
     output_channels: u16,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn create_audio_resampler(
     input_rate: u32,
     output_rate: u32,
@@ -2171,7 +2178,7 @@ fn create_audio_resampler(
     )?))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn prepare_decoded_audio(
     input: &[f32],
     resampler: Option<&mut crate::audio_resampler::AudioResampler>,
@@ -2193,7 +2200,7 @@ fn prepare_decoded_audio(
     Ok(output)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 struct AudioBuffer(
     pub Arc<std::sync::Mutex<ringbuf::HeapRb<f32>>>,
     usize,
@@ -2201,7 +2208,7 @@ struct AudioBuffer(
     Arc<std::sync::atomic::AtomicUsize>,
 );
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 impl Default for AudioBuffer {
     fn default() -> Self {
         Self(
@@ -2215,7 +2222,7 @@ impl Default for AudioBuffer {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 impl AudioBuffer {
     pub fn resize(&mut self, sample_rate: usize, channels: usize) {
         let capacity = sample_rate * channels * AUDIO_BUFFER_MS / 1000;
@@ -2328,7 +2335,7 @@ impl AudioBuffer {
     }
 }
 
-#[cfg(all(test, not(target_os = "linux")))]
+#[cfg(all(test, not(any(target_os = "linux", target_os = "android"))))]
 mod audio_buffer_discontinuity_tests {
     use super::AudioBuffer;
     use std::sync::{
@@ -2393,8 +2400,20 @@ impl AudioHandler {
         Ok(())
     }
 
+    // Audio (plans/soft-frolicking-thimble.md, "Audio" round): cpal's Android backend still needs
+    // oboe, which has real ABI incompatibilities with NDK r30 (see Cargo.toml's cpal dependency
+    // comment). Decoding works (audio_codec_stub.rs's Decoder is real, via a pure-Rust Opus crate),
+    // so playback is wired WITHOUT cpal: push the negotiated format into the headless poll cache
+    // (crate::flutter) — the JNI shim polls it and (re)builds an android.media.AudioTrack.
+    #[cfg(target_os = "android")]
+    fn start_audio(&mut self, format0: AudioFormat) -> ResultType<()> {
+        crate::flutter::push_headless_audio_format(format0.sample_rate, format0.channels as u16);
+        self.sample_rate = (format0.sample_rate, format0.sample_rate);
+        Ok(())
+    }
+
     /// Start the audio playback.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn start_audio(&mut self, format0: AudioFormat) -> ResultType<()> {
         let device = AUDIO_HOST
             .default_output_device()
@@ -2470,12 +2489,14 @@ impl AudioHandler {
                 let keep_existing_stream = self.simple.is_some()
                     && self.sample_rate.0 == f.sample_rate
                     && u32::from(self.channels) == f.channels;
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(target_os = "android")]
+                let keep_existing_stream = false;
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
                 let keep_existing_stream = self.audio_stream.is_some()
                     && self.sample_rate.0 == f.sample_rate
                     && u32::from(self.channels) == f.channels;
                 let buffer = vec![0.; f.sample_rate as usize * f.channels as usize];
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
                 let mut previous = std::mem::take(self);
                 #[cfg(target_os = "windows")]
                 self.prepare_playback(&f);
@@ -2486,7 +2507,7 @@ impl AudioHandler {
                 let keep_existing_stream = keep_existing_stream
                     && !playback_failed
                     && !previous.playback_recovery.report_pending();
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
                 if result.is_err() && keep_existing_stream {
                     // The restarted capture has new Opus history even when output startup fails.
                     previous.audio_decoder = self.audio_decoder.take();
@@ -2521,9 +2542,9 @@ impl AudioHandler {
     /// Handle audio frame and play it.
     #[inline]
     pub fn handle_frame(&mut self, frame: AudioFrame) {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         self.playback_status.report_errors();
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         if self.audio_stream.is_none()
             || !self
                 .playback_status
@@ -2537,17 +2558,64 @@ impl AudioHandler {
             log::trace!("PulseAudio simple binding does not exists");
             return;
         }
-        self.audio_decoder.as_mut().map(|(d, buffer)| {
-            let decoded_frames = match d.decode_float(&frame.data, buffer, false) {
+        // Not a closure (unlike upstream's `.map(|(d, buffer)| ...)`) so the Android diagnostic
+        // branches can reference other `self` fields alongside `d`/`buffer` without a borrow conflict.
+        if let Some((d, buffer)) = self.audio_decoder.as_mut() {
+            // opus-rs is a from-scratch Opus decoder; a panic in this audio thread would kill it
+            // silently for the rest of the session ("format negotiates, then permanent silence").
+            // catch_unwind degrades one bad packet to "this frame dropped" instead.
+            #[cfg(target_os = "android")]
+            let decode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                d.decode_float(&frame.data, buffer, false)
+            }))
+            .unwrap_or_else(|panic_payload| {
+                let msg = panic_payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                log::error!(
+                    "Android audio decode_float PANICKED (input {} bytes): {}",
+                    frame.data.len(),
+                    msg
+                );
+                Err(crate::audio_codec_stub::OpusError::from("decode panicked — see log"))
+            });
+            #[cfg(not(target_os = "android"))]
+            let decode_result = d.decode_float(&frame.data, buffer, false);
+            let decoded_frames = match decode_result {
                 Ok(decoded_frames) => decoded_frames,
                 Err(error) => {
+                    #[cfg(target_os = "android")]
+                    {
+                        self.decode_error_count += 1;
+                        // first one immediately, then every 100th — frames arrive every ~20-60ms
+                        if self.decode_error_count == 1 || self.decode_error_count % 100 == 0 {
+                            log::warn!(
+                                "Android audio decode_float failed (#{}, input {} bytes): {}",
+                                self.decode_error_count,
+                                frame.data.len(),
+                                error
+                            );
+                        }
+                    }
+                    #[cfg(not(target_os = "android"))]
                     log::warn!("Failed to decode audio frame: {error:?}");
                     return;
                 }
             };
+            #[cfg(target_os = "android")]
+            if !self.logged_first_decode {
+                self.logged_first_decode = true;
+                log::info!(
+                    "Android audio: first successful decode ({} samples/channel, {} channels)",
+                    decoded_frames,
+                    self.channels
+                );
+            }
             let channels = self.channels;
             let n = decoded_frames * channels as usize;
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
             {
                 let config = DecodedAudioConfig {
                     sample_rate: self.sample_rate.1,
@@ -2573,11 +2641,17 @@ impl AudioHandler {
                     unsafe { std::slice::from_raw_parts::<u8>(buffer.as_ptr() as _, n * 4) };
                 self.simple.as_mut().map(|x| x.write(data_u8));
             }
-        });
+            // Android: no resample/rechannel — the Kotlin AudioTrack is built to whatever format
+            // the peer negotiated (see NativeBridge.pollAudioFormat). Push the samples as-is.
+            #[cfg(target_os = "android")]
+            {
+                crate::flutter::push_headless_audio_pcm(&buffer[0..n]);
+            }
+        }
     }
 
     /// Build audio output stream for current device.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn build_output_stream<T: cpal::Sample + cpal::SizedSample + cpal::FromSample<f32>>(
         &mut self,
         config: &StreamConfig,
@@ -2685,12 +2759,18 @@ impl VideoHandler {
     pub fn new(format: CodecFormat, _display: usize) -> Self {
         let luid = Self::get_adapter_luid();
         log::info!("new video handler for display #{_display}, format: {format:?}, luid: {luid:?}");
-        let rgba_format =
-            if cfg!(feature = "flutter") && (cfg!(windows) || cfg!(target_os = "linux")) {
-                ImageFormat::ABGR
-            } else {
-                ImageFormat::ARGB
-            };
+        // M3 (plans/soft-frolicking-thimble.md): scrap's "ARGB"/"ABGR" follow libyuv's packed-int
+        // naming, the OPPOSITE of the in-memory byte order on little-endian: ABGR writes R,G,B,A.
+        // Android always takes the soft-render path and the android-shim copies the buffer straight
+        // into a Bitmap.Config.ARGB_8888 (R,G,B,A in memory), so it needs ABGR too — the else
+        // branch rendered blue UI elements red.
+        let rgba_format = if cfg!(feature = "flutter")
+            && (cfg!(windows) || cfg!(target_os = "linux") || cfg!(target_os = "android"))
+        {
+            ImageFormat::ABGR
+        } else {
+            ImageFormat::ARGB
+        };
         VideoHandler {
             decoder: Decoder::new(format, luid),
             rgb: ImageRgb::new(rgba_format, crate::get_dst_align_rgba()),
@@ -5339,7 +5419,10 @@ pub mod peer_online {
         connect_tcp(online_server, CONNECT_TIMEOUT).await
     }
 
-    async fn query_online_states_(
+    // lobishell-android: widened from private to pub(crate) (no logic change) so flutter.rs's
+    // session_is_id_online can call it directly — the pub query_online_states wrapper needs the
+    // Flutter async runner + event stream our headless client does not set up.
+    pub(crate) async fn query_online_states_(
         ids: &Vec<String>,
         timeout: std::time::Duration,
     ) -> ResultType<(Vec<String>, Vec<String>)> {

@@ -15,9 +15,10 @@
 use super::*;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use hbb_common::anyhow::anyhow;
+// LobiShell Android: magnum_opus is replaced by crate::audio_codec_stub (see that file).
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use magnum_opus::Application::LowDelay;
-use magnum_opus::{Channels::*, Encoder};
+use crate::audio_codec_stub::Application::LowDelay;
+use crate::audio_codec_stub::{Channels::*, Encoder};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const NAME: &'static str = "audio";
