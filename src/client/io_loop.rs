@@ -195,6 +195,10 @@ impl<T: InvokeUiSession> Remote<T> {
         } else {
             ConnType::default()
         };
+        #[cfg(target_os = "android")]
+        if conn_type == ConnType::DEFAULT_CONN {
+            crate::flutter::reset_headless_connection_security(&self.handler.get_id());
+        }
 
         match Client::start(
             &self.handler.get_id(),
@@ -222,10 +226,24 @@ impl<T: InvokeUiSession> Remote<T> {
                 };
                 self.handler
                     .set_connection_type(is_secured, direct, stream_type); // flutter -> connection_ready
+                #[cfg(target_os = "android")]
+                if conn_type == ConnType::DEFAULT_CONN {
+                    crate::flutter::record_headless_connection_security(&self.handler.get_id(), is_secured, direct);
+                }
+                // lobishell-android: confirm_insecure_connection shows a "continue anyway?" msgbox
+                // and waits for the answer. The headless client has no UI to show it, so such a
+                // session used to hang here forever without a picture — refuse it instead and
+                // record why, so the plugin can tell the user (see headless_connection_security).
                 if !is_secured
                     && !crate::common::is_direct_ip_access(&self.handler.get_id())
-                    && !client::confirm_insecure_connection(&self.handler, &mut self.receiver).await
+                    && (cfg!(target_os = "android")
+                        || !client::confirm_insecure_connection(&self.handler, &mut self.receiver).await)
                 {
+                    #[cfg(target_os = "android")]
+                    if conn_type == ConnType::DEFAULT_CONN {
+                        crate::flutter::record_headless_insecure_rejected(&self.handler.get_id());
+                    }
+                    log::warn!("Refusing a session that is not end-to-end encrypted");
                     self.send_close_reason(&mut peer, "").await;
                     if kcp.is_some() {
                         tokio::time::sleep(KCP_CLOSE_REASON_FLUSH_DELAY).await;

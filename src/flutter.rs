@@ -909,6 +909,72 @@ pub fn take_headless_quality_status() -> String {
     serde_json::Value::Object(obj).to_string()
 }
 
+// ---------------------------------------------------------------------------------------------
+// lobishell-android (connection security): right after the handshake io_loop knows whether the
+// session is end-to-end encrypted (`set_connection_type`'s is_secured — false whenever the
+// peer's signed key could not be verified, which direct-IP access always is), and on Android it
+// refuses such a session through an ID server instead of waiting for the answer to a msgbox the
+// headless client can never show. Neither reaches the plugin through the no-op push_event path,
+// so it is cached here per peer id (default connections only) and polled by the shim.
+#[derive(Default, Clone)]
+struct HeadlessConnSecurity {
+    secure: Option<bool>,
+    direct: Option<bool>,
+    insecure_rejected: bool,
+}
+
+lazy_static::lazy_static! {
+    static ref HEADLESS_CONN_SECURITY: std::sync::Mutex<HashMap<String, HeadlessConnSecurity>> =
+        std::sync::Mutex::new(HashMap::new());
+}
+
+/// lobishell-android: forget what an earlier connection to [peer_id] reported — a new attempt starts.
+pub fn reset_headless_connection_security(peer_id: &str) {
+    HEADLESS_CONN_SECURITY.lock().unwrap().remove(peer_id);
+}
+
+pub fn record_headless_connection_security(peer_id: &str, secure: bool, direct: bool) {
+    let mut map = HEADLESS_CONN_SECURITY.lock().unwrap();
+    let entry = map.entry(peer_id.to_owned()).or_default();
+    entry.secure = Some(secure);
+    entry.direct = Some(direct);
+}
+
+pub fn record_headless_insecure_rejected(peer_id: &str) {
+    HEADLESS_CONN_SECURITY
+        .lock()
+        .unwrap()
+        .entry(peer_id.to_owned())
+        .or_default()
+        .insecure_rejected = true;
+}
+
+/// lobishell-android: what is known about the security of [session_id]'s connection, as JSON —
+/// `{"secure":false,"direct":true,"insecure_rejected":false}` — or `"{}"` before the handshake.
+/// Unknown fields are omitted, like [take_headless_quality_status].
+pub fn headless_connection_security(session_id: &SessionID) -> String {
+    let Some(peer_id) = sessions::get_peer_id_by_session_id(session_id, ConnType::DEFAULT_CONN) else {
+        return "{}".to_owned();
+    };
+    let state = HEADLESS_CONN_SECURITY
+        .lock()
+        .unwrap()
+        .get(&peer_id)
+        .cloned()
+        .unwrap_or_default();
+    let mut obj = serde_json::Map::new();
+    if let Some(secure) = state.secure {
+        obj.insert("secure".to_string(), serde_json::Value::Bool(secure));
+    }
+    if let Some(direct) = state.direct {
+        obj.insert("direct".to_string(), serde_json::Value::Bool(direct));
+    }
+    if state.insecure_rejected {
+        obj.insert("insecure_rejected".to_string(), serde_json::Value::Bool(true));
+    }
+    serde_json::Value::Object(obj).to_string()
+}
+
 // lobishell-android (file transfer): the file-transfer InvokeUiSession callbacks below
 // (`update_folder_files`, `job_progress`, `job_done`, `job_error`, `override_file_confirm`) only
 // ever `push_event(...)`, which is a no-op for a headless session (`session_start_headless` never
