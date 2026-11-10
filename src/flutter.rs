@@ -2372,6 +2372,24 @@ pub fn session_get_display_count(session_id: SessionID) -> i32 {
     0
 }
 
+/// Multi-monitor (lobishell-android): the display the host offers first, `PeerInfo.current_display`
+/// — at login the host sets it to its PRIMARY display (connection.rs, from
+/// `update_get_sync_displays_on_login`), which is not necessarily index 0. Flutter reads it from
+/// the "peer_info" event; a headless session has no event stream, so the Android client polls it
+/// here and starts on that display instead of always on display 0. -1 while not known yet (no
+/// displays reported); an out-of-range index falls back to 0, as `handle_peer_info` does.
+pub fn session_get_current_display(session_id: SessionID) -> i32 {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        let pi = session.peer_info.read().unwrap();
+        if pi.displays.is_empty() {
+            return -1;
+        }
+        let idx = pi.current_display;
+        return if idx >= 0 && (idx as usize) < pi.displays.len() { idx } else { 0 };
+    }
+    -1
+}
+
 /// Privacy mode (plans/soft-frolicking-thimble.md): whether the connected peer advertised support
 /// for it at all (`PeerInfo.features.privacy_mode`, the same field RustDesk's own Flutter UI reads
 /// via `set_peer_info`'s push_event — `set_peer_info` already unconditionally caches the peer's
