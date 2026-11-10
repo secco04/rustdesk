@@ -854,6 +854,10 @@ struct HeadlessQualityStatus {
     speed: Option<String>,
     fps: Option<i32>,
     delay: Option<i32>,
+    // When `delay` last arrived. The host sends a TestDelay about once a second for as long as the
+    // connection lives, whatever the screen shows, so its age is the liveness signal: `delay`
+    // itself is kept forever (latest-value cache) and on its own made a dead connection look alive.
+    delay_at: Option<std::time::Instant>,
     target_bitrate: Option<i32>,
     codec_format: Option<String>,
 }
@@ -875,6 +879,7 @@ fn push_headless_quality_status(status: &QualityStatus) {
     }
     if status.delay.is_some() {
         state.delay = status.delay;
+        state.delay_at = Some(std::time::Instant::now());
     }
     if status.target_bitrate.is_some() {
         state.target_bitrate = status.target_bitrate;
@@ -887,7 +892,8 @@ fn push_headless_quality_status(status: &QualityStatus) {
 /// lobishell-android: the latest known connection stats as a JSON object, or `"{}"` if nothing has
 /// arrived yet. Any field not yet known is simply omitted (not written as `null`), so the caller
 /// can treat a missing key exactly like "unknown" without a separate null-check. Layout:
-/// `{"speed":"1.2MB/s","fps":30,"delay":45,"target_bitrate":2000,"codec_format":"VP9"}`.
+/// `{"speed":"1.2MB/s","fps":30,"delay":45,"delay_age_ms":800,"target_bitrate":2000,"codec_format":"VP9"}`.
+/// `delay_age_ms` is how long ago `delay` arrived — see `HeadlessQualityStatus::delay_at`.
 pub fn take_headless_quality_status() -> String {
     let state = HEADLESS_QUALITY.lock().unwrap().clone();
     let mut obj = serde_json::Map::new();
@@ -899,6 +905,10 @@ pub fn take_headless_quality_status() -> String {
     }
     if let Some(delay) = state.delay {
         obj.insert("delay".to_string(), serde_json::Value::from(delay));
+    }
+    if let Some(at) = state.delay_at {
+        let age_ms = u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        obj.insert("delay_age_ms".to_string(), serde_json::Value::from(age_ms));
     }
     if let Some(target_bitrate) = state.target_bitrate {
         obj.insert("target_bitrate".to_string(), serde_json::Value::from(target_bitrate));
@@ -973,6 +983,24 @@ pub fn headless_connection_security(session_id: &SessionID) -> String {
         obj.insert("insecure_rejected".to_string(), serde_json::Value::Bool(true));
     }
     serde_json::Value::Object(obj).to_string()
+}
+
+/// lobishell-android: where [session_id]'s connection stands — 0 connecting, 1 connected,
+/// 2 disconnected (io_loop ended: peer reset, network error, receive timeout, peer gone),
+/// -1 no such session (closed). Flutter hears about a drop through the msgbox io_loop shows on its
+/// way out; that goes to the headless client's no-op push_event, so the plugin polls this instead.
+pub fn headless_connection_state(session_id: &SessionID) -> i32 {
+    let Some(session) = sessions::get_session_by_session_id(session_id) else {
+        return -1;
+    };
+    let state = session.connection_round_state.lock().unwrap();
+    if state.is_connected() {
+        1
+    } else if state.is_disconnected() {
+        2
+    } else {
+        0
+    }
 }
 
 // lobishell-android (file transfer): the file-transfer InvokeUiSession callbacks below

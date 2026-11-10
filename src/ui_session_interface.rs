@@ -140,6 +140,13 @@ impl ConnectionRoundState {
     pub fn is_connected(&self) -> bool {
         matches!(self.state, ConnectionState::Connected)
     }
+
+    /// lobishell-android: true once io_loop has ended (peer reset, network error, receive
+    /// timeout, peer gone). Flutter learns that from the msgbox the loop shows on its way out; the
+    /// headless client has no msgbox, so the plugin polls this instead.
+    pub fn is_disconnected(&self) -> bool {
+        matches!(self.state, ConnectionState::Disconnected)
+    }
 }
 
 impl Default for ConnectionRoundState {
